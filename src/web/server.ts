@@ -39,7 +39,13 @@ import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync, readFileSync, chmodSync, rmSync, statSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { execSync } from 'node:child_process';
-import { hostname as getHostname } from 'node:os';
+import { hostname as getHostname, uptime as osUptime } from 'node:os';
+import {
+  looksLikeHostReboot,
+  newestPersistedActivity,
+  planRebootRestore,
+  resolveResumeConversationId,
+} from '../reboot-restore.js';
 import { dataPath, getDataDir, CODEMAN_INSTANCE } from '../config/instance.js';
 import { normalizeBasePath, stripBasePath, joinBasePath } from '../config/base-path.js';
 import { GLYPH, palette } from '../cli-style.js';
@@ -2857,6 +2863,119 @@ export class WebServer extends EventEmitter {
     return false;
   }
 
+  /**
+   * SPIKE — check whether reboot restore is enabled in settings (default: false).
+   *
+   * Off by default on purpose. The pass creates panes and relaunches CLIs without
+   * anyone asking, so it stays opt-in until the behaviour has been lived with.
+   */
+  private async isRebootRestoreEnabled(): Promise<boolean> {
+    const settingsPath = dataPath('settings.json');
+    try {
+      const content = await fs.readFile(settingsPath, 'utf-8');
+      const settings = JSON.parse(content);
+      return settings.rebootRestoreEnabled ?? false;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        console.error('Failed to read reboot restore setting:', err);
+      }
+    }
+    return false;
+  }
+
+  /**
+   * SPIKE — rebuild the sessions a host reboot destroyed.
+   *
+   * Runs inside `restoreMuxSessions()`, in the window after `reconcileSessions()`
+   * has reported the dead sessions and before `finalizeRestoredState()` prunes
+   * their records, so `state.json` is still the full picture here.
+   *
+   * The rebuilt `Session` is constructed the same way the attach path below
+   * constructs one, with two differences. It gets no `muxSession`, so
+   * `startInteractive()` takes its create branch and makes a fresh pane instead
+   * of attaching to one. It gets `resumeSessionId`, so that pane launches
+   * `claude --resume <conversation>` and lands back in the conversation the pane
+   * was holding.
+   *
+   * A restored session comes back attached and idle. Respawn controllers, Ralph
+   * loops and auto-resume timers are deliberately NOT re-armed: the user did not
+   * ask for a reboot to restart an autonomous run, and a machine that just came
+   * up is the worst moment to turn one loose.
+   *
+   * @returns how many sessions were rebuilt.
+   */
+  private async restoreSessionsLostToReboot(dead: string[], livePaneCount: number): Promise<number> {
+    if (dead.length === 0) return 0;
+    if (!(await this.isRebootRestoreEnabled())) return 0;
+
+    const persisted = this.store.getSessions();
+    if (
+      !looksLikeHostReboot({
+        livePaneCount,
+        deadSessionCount: dead.length,
+        uptimeSeconds: osUptime(),
+        newestPersistedActivityAt: newestPersistedActivity(persisted),
+        now: Date.now(),
+      })
+    ) {
+      return 0;
+    }
+
+    const { restore, skipped } = planRebootRestore(dead, persisted);
+    if (skipped.length > 0) {
+      console.log(`[Server] Reboot restore is passing over ${skipped.length} dead session(s):`);
+      for (const rejection of skipped) {
+        console.log(`[Server]   ${rejection.sessionId}: ${rejection.reason}`);
+      }
+    }
+    if (restore.length === 0) return 0;
+    console.log(`[Server] Host reboot detected; rebuilding ${restore.length} session(s)`);
+
+    let rebuilt = 0;
+    for (const saved of restore) {
+      if (this.sessions.has(saved.id)) continue;
+      try {
+        const claudeModeConfig = await this.getClaudeModeConfig();
+        const session = new Session({
+          id: saved.id,
+          workingDir: saved.workingDir,
+          mode: saved.mode,
+          name: saved.name,
+          createdAt: saved.createdAt,
+          mux: this.mux,
+          useMux: true,
+          // No `muxSession`: the reboot took the pane with it, so this has to CREATE.
+          claudeMode: await resolveClaudeModeForUsername(claudeModeConfig.claudeMode, saved.owner),
+          allowedTools: claudeModeConfig.allowedTools,
+          resumeSessionId: resolveResumeConversationId(saved),
+          envOverrides: (saved as { __envOverrides?: Record<string, string> }).__envOverrides,
+          effort: saved.effort,
+          attachmentHistory:
+            (saved as { __attachmentHistory?: SessionAttachmentHistoryItem[] }).__attachmentHistory ??
+            saved.attachmentHistory,
+          lastSubmitAt: saved.lastSubmitAt,
+          claudeSessionChain: saved.claudeSessionChain,
+          lastActivityAt: saved.lastActivityAt,
+          owner: saved.owner,
+          parentSessionId: saved.parentSessionId,
+        });
+
+        this.sessions.set(session.id, session);
+        await this.setupSessionListeners(session);
+        await session.startInteractive();
+        getLifecycleLog().log({ event: 'recovered', sessionId: session.id, name: session.name });
+        this.persistSessionState(session);
+        rebuilt += 1;
+        console.log(`[Server] Rebuilt session ${session.id} after reboot (resume ${session.claudeSessionId})`);
+      } catch (err) {
+        // One workspace that has gone missing must not stop the rest of the pass.
+        this.sessions.delete(saved.id);
+        console.error(`[Server] Failed to rebuild session ${saved.id} after reboot:`, err);
+      }
+    }
+    return rebuilt;
+  }
+
   private async restoreMuxSessions(): Promise<boolean> {
     try {
       // Reconcile mux sessions to find which ones are still alive (also discovers unknown ones)
@@ -2865,6 +2984,12 @@ export class WebServer extends EventEmitter {
       if (discovered.length > 0) {
         console.log(`[Server] Discovered ${discovered.length} unknown mux session(s)`);
       }
+
+      // SPIKE — rebuild what a host reboot destroyed. This has to run HERE:
+      // `dead` is only known after reconciliation, and the records it reads are
+      // pruned by `cleanupStaleSessions()` as soon as `finalizeRestoredState()`
+      // runs. The pass is a no-op unless the opt-in setting is on.
+      const rebootRestored = await this.restoreSessionsLostToReboot(dead, alive.length);
 
       if (alive.length > 0 || discovered.length > 0) {
         console.log(`[Server] Found ${alive.length + discovered.length} alive mux session(s) from previous run`);
@@ -3135,6 +3260,14 @@ export class WebServer extends EventEmitter {
         await this.ensureHooksForRecoveredWorkspaces();
 
         // Start stats collection for mux sessions
+        this.mux.startStatsCollection(STATS_COLLECTION_INTERVAL_MS);
+      }
+
+      // SPIKE — a reboot leaves `alive` and `discovered` both empty, so the block
+      // above never ran and never started stats collection. Sessions the reboot
+      // pass rebuilt are live panes and need it too.
+      if (rebootRestored > 0 && alive.length === 0 && discovered.length === 0) {
+        await this.ensureHooksForRecoveredWorkspaces();
         this.mux.startStatsCollection(STATS_COLLECTION_INTERVAL_MS);
       }
 

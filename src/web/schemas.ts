@@ -1257,6 +1257,11 @@ export const SettingsUpdateSchema = z
      * explicit press). Shell-safety is validated again at spawn time.
      */
     readMyMindModel: z.string().max(100).optional(),
+    /**
+     * SPIKE — rebuild sessions a host reboot destroyed, on the next server boot.
+     * Off by default: the pass creates panes and relaunches CLIs unprompted.
+     */
+    rebootRestoreEnabled: z.boolean().optional(),
     tunnelEnabled: z.boolean().optional(),
     // Action field (NOT persisted): explicit per-request acknowledgment that the
     // operator accepts exposing an UNAUTHENTICATED public tunnel (no CODEMAN_PASSWORD).
