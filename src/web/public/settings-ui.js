@@ -617,6 +617,8 @@ Object.assign(CodemanApp.prototype, {
     // overwrites the system clipboard on a gesture the user may have meant only as
     // a way to read, so it is opt-in rather than a default anyone has to discover.
     document.getElementById('appSettingsAutoCopySelection').checked = settings.autoCopySelection === true;
+    // Code-block Copy button: per-device (it needs a hovering pointer), default OFF.
+    document.getElementById('appSettingsTerminalCodeCopy').checked = settings.terminalCodeCopy === true;
     // Default ON, so an absent key reads as enabled rather than as off.
     document.getElementById('appSettingsCopyStripMargin').checked = settings.copyStripMargin !== false;
     document.getElementById('appSettingsTerminalFont').value = settings.terminalFontFamily || '';
@@ -2951,6 +2953,7 @@ Object.assign(CodemanApp.prototype, {
       tunnelEnabled: document.getElementById('appSettingsTunnelEnabled').checked,
       localEchoEnabled: document.getElementById('appSettingsLocalEcho').checked,
       autoCopySelection: document.getElementById('appSettingsAutoCopySelection').checked,
+      terminalCodeCopy: document.getElementById('appSettingsTerminalCodeCopy').checked,
       copyStripMargin: document.getElementById('appSettingsCopyStripMargin').checked,
       terminalFontFamily: document.getElementById('appSettingsTerminalFont').value.trim(),
       terminalFontWeight: this.readTerminalFontWeight(document.getElementById('appSettingsTerminalFontWeight')),
@@ -3215,6 +3218,9 @@ Object.assign(CodemanApp.prototype, {
       // and absent from SettingsUpdateSchema (.strict()), so sending it would
       // 400 the whole settings PUT.
       autoCopySelection: _acs,
+      // Needs a hovering pointer, so it is a property of this device, and the
+      // key is absent from SettingsUpdateSchema (.strict()).
+      terminalCodeCopy: _tcc,
       // What the clipboard gets is a property of what this device is looking
       // at, and the key is absent from SettingsUpdateSchema (.strict()), so
       // sending it would 400 the whole settings PUT.
@@ -4888,7 +4894,7 @@ Object.assign(CodemanApp.prototype, {
       'terminalFontFamily', 'terminalFontWeight', 'terminalFontWeightBold',
       'language',
       'terminalWheelLocalScrollback',
-      'autoCopySelection', 'copyStripMargin',
+      'autoCopySelection', 'copyStripMargin', 'terminalCodeCopy',
       'showSessionButton', 'showAwayDigestButton', 'showCronButton', 'showGitStatus', 'gitStatusTree', 'gitStatusMaxRepos', 'gitStatusTimeoutSeconds',
       'showTabDetachButton',
       'mobileOverviewEnabled',

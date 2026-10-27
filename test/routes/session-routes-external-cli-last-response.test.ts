@@ -13,6 +13,7 @@
  *   - ?context=full blocks carry role — the frontend renders via msg.role, so a
  *     block without it lost the "You" badge on prompts
  *   - a pane that has produced no output reports hasContext: false rather than 404ing
+ *   - pane-segmented answers carry source: 'pane' (the code-copy button skips them)
  *   - Claude mode still takes the Claude path (regression guard)
  *   - copilot (a repainting full-screen TUI) is read off the pane SCREEN via
  *     capturePaneText, and falls back to the buffer only when there is no screen
@@ -118,6 +119,8 @@ describe('GET /api/sessions/:id/last-response — external CLI panes', () => {
       expect(body.data.hasContext).toBe(true);
       // Short form stays short: blocks only travel under ?context=full.
       expect(body.data.messages).toBeUndefined();
+      // Pane-segmented text is marked, so the terminal's code-copy button skips it.
+      expect(body.data.source).toBe('pane');
     });
   }
 
@@ -127,6 +130,7 @@ describe('GET /api/sessions/:id/last-response — external CLI panes', () => {
 
     const { body } = await lastResponse(true);
 
+    expect(body.data.source).toBe('pane');
     const kinds = body.data.messages.map((block: { kind: string }) => block.kind);
     expect(kinds).toContain('prompt');
     expect(kinds).toContain('response');
@@ -225,5 +229,7 @@ describe('GET /api/sessions/:id/last-response — external CLI panes', () => {
 
     expect(res.statusCode).toBe(200);
     expect(body.data.text).not.toContain('Documented the helper');
+    // Only pane-segmented answers carry a source.
+    expect(body.data.source).toBeUndefined();
   });
 });

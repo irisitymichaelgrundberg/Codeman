@@ -33,8 +33,12 @@ Agent CLIs hold the mouse: clicks and drags are reported into the transcript rat
 selecting text. `Shift+drag` starts a selection anyway, right-click copies it (with nothing
 selected the native context menu is left alone), and `Ctrl+Shift+C` copies without ever
 interrupting. **Auto Copy Selection** in **App Settings → Terminal & Input**, off by
-default, copies the moment you release the mouse. On phones, long-press selects; see
-[Mobile Guide](Mobile-Guide).
+default, copies the moment you release the mouse. **Copy Button on Code Blocks**, in the
+same place and also off by default, puts a Copy button on a code block from the agent's
+answer when you hover it on desktop, and copies the block as the agent wrote it. It works
+for Claude Code and Codex, except in remote sessions, and for DeepSeek outside Docker and
+remote sessions, because Codeman reads those CLIs' transcript files. On phones, long-press
+selects; see [Mobile Guide](Mobile-Guide).
 
 ## Zero-lag local echo
 

@@ -1450,6 +1450,416 @@ function cleanCopiedSelection(text, options) {
   return lines.join('\n');
 }
 
+// ── Code-block copy in the terminal ─────────────────────────────────────────
+// The Response Viewer gives every fenced code block a Copy button because it
+// renders the transcript's MARKDOWN, where the fences say where a block starts
+// and ends. The terminal has no fences: Claude draws a block as indented,
+// highlighted text, word-wraps a long line onto the next row with no marker,
+// and expands tabs. To put the same button on the terminal, the blocks are
+// taken from the transcript and located on screen by their text, and the
+// button copies the TRANSCRIPT text, never the screen text, so the clipboard
+// gets the original lines with no gutter, padding or wrap breaks.
+
+/**
+ * A block line or a screen row with every whitespace character removed.
+ * Comparing compacted text absorbs the gutter, tab expansion and the space a
+ * word wrap swallows at the break, all of which change only whitespace.
+ */
+function compactCodeText(text) {
+  return String(text ?? '').replace(/\s+/g, '');
+}
+
+const CODE_TEXT_SPACE_RE = /\s/;
+
+/**
+ * Where a line or row has whitespace between two non-whitespace characters, as
+ * sorted offsets into its compacted text. Leading and trailing whitespace adds
+ * none. The walk goes by UTF-16 index, so offsets line up with the `.length` of
+ * `compactCodeText`.
+ */
+function codeTextGaps(text) {
+  const s = String(text ?? '');
+  const gaps = [];
+  let n = 0;
+  let pending = false;
+  for (let i = 0; i < s.length; i++) {
+    if (CODE_TEXT_SPACE_RE.test(s[i])) {
+      if (n > 0) pending = true;
+      continue;
+    }
+    if (pending) gaps.push(n);
+    pending = false;
+    n++;
+  }
+  return gaps;
+}
+
+/**
+ * Glyphs Claude draws in the gutter in front of a message's first row (the
+ * message bullet) or a tool result. A code block that opens a message shares
+ * its first row with the bullet, so the bullet must not count as code. Codex
+ * draws `•` in the same gutter column (cli-registry stock.ts, the codex
+ * `transcriptGutter` comment).
+ */
+const CODE_BLOCK_ROW_GLYPH_RE = /^\s*[●⏺⎿•]\s/;
+
+/**
+ * A screen row that is only a horizontal rule. Claude's fullscreen renderer
+ * frames its scrolling transcript with one above the composer, so a block cut
+ * off by that frame is cut off at a rule row rather than at the last row.
+ */
+const CODE_BLOCK_RULE_ROW_RE = /^[─━═]{10,}$/;
+
+/**
+ * Rows of chrome allowed between a cut-off block and the screen edge or rule
+ * that cut it off.
+ */
+const CODE_BLOCK_EDGE_SLACK_ROWS = 2;
+
+/**
+ * Shortest match, in compacted characters, that a block cut off at an edge of
+ * the screen still needs before it gets a button. A full block needs only two:
+ * it matched from its first line to its last.
+ */
+const CODE_BLOCK_PARTIAL_MIN_CHARS = 12;
+
+/**
+ * Shortest match, in compacted characters, for a cut-off block whose visible
+ * rows are whole block lines, such as a function's last line alone below the
+ * top edge. A sliver that starts or ends partway through a line can be the end
+ * of any sentence, so it keeps the longer minimum above. Shorter whole lines,
+ * such as `Claude:` or `Checks`, also end up on screen as prose.
+ */
+const CODE_BLOCK_PARTIAL_LINE_MIN_CHARS = 8;
+
+/** The prepared form of each block list `matchCodeBlocksInRows` has seen, keyed by the list. */
+const preparedCodeBlocks = new WeakMap();
+
+/**
+ * Every fenced or indented code block in a list of transcript messages, in
+ * order, as `{ text, lang }`. `lex` is marked's lexer, passed in so this stays
+ * pure. Blocks nested in lists and blockquotes are included, since Claude
+ * draws those too.
+ */
+function extractMarkdownCodeBlocks(messages, lex) {
+  const blocks = [];
+  if (!Array.isArray(messages) || typeof lex !== 'function') return blocks;
+  const walk = (tokens) => {
+    if (!Array.isArray(tokens)) return;
+    for (const token of tokens) {
+      if (!token || typeof token !== 'object') continue;
+      if (token.type === 'code' && typeof token.text === 'string') {
+        blocks.push({ text: token.text, lang: typeof token.lang === 'string' ? token.lang : '' });
+        continue;
+      }
+      walk(token.tokens);
+      if (Array.isArray(token.items)) for (const item of token.items) walk(item?.tokens);
+    }
+  };
+  for (const message of messages) {
+    const text = typeof message?.text === 'string' ? message.text : '';
+    if (!text.includes('```') && !text.includes('~~~') && !/^ {4}/m.test(text)) continue;
+    try {
+      walk(lex(text));
+    } catch {
+      /* unparseable markdown has no blocks to offer */
+    }
+  }
+  return blocks;
+}
+
+/**
+ * Where code blocks appear in a run of screen rows.
+ *
+ * `rows` are the visible terminal rows as text, top to bottom. Each block line
+ * must equal one row, or several consecutive rows joined (a wrapped line),
+ * after compacting. A blank block line takes a blank row if there is one. A
+ * block may run off the top or bottom of the screen, or into the rule row of
+ * Claude's fullscreen frame; such a match is `partial` and must cover at least
+ * `CODE_BLOCK_PARTIAL_MIN_CHARS` compacted characters, or
+ * `CODE_BLOCK_PARTIAL_LINE_MIN_CHARS` when it covers whole block lines only.
+ *
+ * A row must also agree with the block line on where interior whitespace
+ * falls, though not on how much of it there is. So only blocks that differ in
+ * indentation or in the amount of whitespace stay interchangeable on screen.
+ *
+ * Overlapping matches are settled longest first, with a complete match ahead
+ * of a partial one. A partial match that strictly contains a complete match of
+ * a different block wins, though, because it explains every row the complete
+ * match does and more. That holds only while no other blocks explain the
+ * partial match's extra rows; when they do, the rows read equally as the
+ * complete match plus those blocks, and none of them get a button. Only blocks
+ * with identical text are interchangeable, and they resolve to the first in the
+ * list. Rows that match several blocks which differ only in indentation or in
+ * the amount of whitespace get no button, because the screen cannot tell them
+ * apart and the clipboard would get whichever one came first.
+ *
+ * The prepared form of `blocks` is cached by the array's identity, so a caller
+ * must pass a new array whenever the list changes and never edit one in place.
+ *
+ * @param {string[]} rows
+ * @param {{text: string}[]} blocks
+ * @returns {{block: number, startRow: number, endRow: number, partial: boolean}[]}
+ *   `endRow` is inclusive; results are sorted by `startRow`.
+ */
+function matchCodeBlocksInRows(rows, blocks) {
+  if (!Array.isArray(rows) || !Array.isArray(blocks) || rows.length === 0) return [];
+  const stripped = rows.map((row) => String(row ?? '').replace(CODE_BLOCK_ROW_GLYPH_RE, ''));
+  const rc = stripped.map(compactCodeText);
+  const rg = stripped.map(codeTextGaps);
+  // The bottom edge is the last row, or a row just above the fullscreen
+  // frame's rule: while scrolled up, Claude overlays "Jump to bottom" on the
+  // last transcript row and may put a notice row under it. A frame cut leaves
+  // no blank row between the last transcript row and the rule, since the
+  // overlay and its notice row are not blank. Claude's inline renderer does
+  // draw a blank row between the answer and the composer rule, so a blank row
+  // before the rule means the block ended there and was not cut off.
+  const isEdge = (j) => {
+    for (let k = j; k <= j + CODE_BLOCK_EDGE_SLACK_ROWS; k++) {
+      if (k >= rc.length || CODE_BLOCK_RULE_ROW_RE.test(rc[k])) return true;
+      if (rc[k] === '') return false;
+    }
+    return false;
+  };
+  // The top edge is the first row, or a row just below a rule, with the same
+  // slack: while scrolled up, Claude's fullscreen renderer pins the turn's
+  // prompt to the first row. As for the bottom edge, a blank row in between
+  // means the block started below it and was not cut off.
+  const isTopEdge = (j) => {
+    for (let k = j; k >= j - CODE_BLOCK_EDGE_SLACK_ROWS; k--) {
+      if (k < 0 || CODE_BLOCK_RULE_ROW_RE.test(rc[k])) return true;
+      if (rc[k] === '') return false;
+    }
+    return false;
+  };
+
+  // The prepared form depends on the block list alone, and the matcher runs
+  // on every repaint while the pointer rests over the terminal, so it is
+  // built once per list. A refetch assigns a new array, which gets a new entry.
+  let prepared = preparedCodeBlocks.get(blocks);
+  if (!prepared) {
+    prepared = [];
+    for (let b = 0; b < blocks.length; b++) {
+      const text = String(blocks[b]?.text ?? '');
+      const split = text.split('\n');
+      const lines = split.map(compactCodeText);
+      const gaps = split.map(codeTextGaps);
+      while (lines.length && !lines[0]) {
+        lines.shift();
+        gaps.shift();
+      }
+      while (lines.length && !lines[lines.length - 1]) {
+        lines.pop();
+        gaps.pop();
+      }
+      const chars = lines.reduce((n, l) => n + l.length, 0);
+      if (chars < 2) continue;
+      const gapSets = gaps.map((g) => new Set(g));
+      // The block's real text, which tells apart blocks that differ only in
+      // whitespace. Trailing spaces and blank edge lines never reach the screen.
+      const rawLines = text.split('\n').map((l) => l.trimEnd());
+      while (rawLines.length && !rawLines[0]) rawLines.shift();
+      while (rawLines.length && !rawLines[rawLines.length - 1]) rawLines.pop();
+      prepared.push({ b, lines, gaps, gapSets, chars, raw: rawLines.join('\n') });
+    }
+    preparedCodeBlocks.set(blocks, prepared);
+  }
+
+  // Whether row `j`, placed at compacted offset `base` of a block line with
+  // interior whitespace at `lineGaps`, has its own interior whitespace in the
+  // same places and no fewer. `lineGapSet` holds the same offsets as
+  // `lineGaps`, for a constant-time lookup. The row's two ends are row
+  // boundaries and stay free, because a word wrap may break at a space or
+  // inside a word.
+  const gapsAgree = (lineGaps, lineGapSet, base, j) => {
+    const len = rc[j].length;
+    let inside = 0;
+    for (const g of lineGaps) if (g > base && g < base + len) inside++;
+    if (inside !== rg[j].length) return false;
+    for (const g of rg[j]) if (!lineGapSet.has(base + g)) return false;
+    return true;
+  };
+
+  // Consume block lines from `i` against rows from `j`. `head` is the part of
+  // line `i` already above the screen, when the first row starts mid-line.
+  // Returns the row after the match, the compacted characters it covered,
+  // whether it ran into an edge and whether that edge cut a line in two, or
+  // null on a mismatch no edge explains.
+  const run = (p, i, j, head = '') => {
+    const lines = p.lines;
+    let covered = 0;
+    for (; i < lines.length; i++, head = '') {
+      const target = lines[i];
+      if (!target) {
+        if (j < rc.length && rc[j] === '') j++;
+        continue;
+      }
+      let acc = head;
+      while (acc.length < target.length && j < rc.length && rc[j] !== '') {
+        const next = acc + rc[j];
+        if (!target.startsWith(next) || !gapsAgree(p.gaps[i], p.gapSets[i], acc.length, j)) break;
+        acc = next;
+        j++;
+      }
+      covered += acc.length - head.length;
+      if (acc === target) continue;
+      if (isEdge(j) && covered) return { end: j, covered, cutBottom: true, cutMidLine: acc.length > 0 };
+      return null;
+    }
+    return { end: j, covered, cutBottom: false };
+  };
+
+  const candidates = [];
+  // `cutTopMidLine` says the first visible row starts partway through a line.
+  const consider = (p, start, res, cutTop, cutTopMidLine = false) => {
+    if (!res || res.end <= start) return;
+    const partial = cutTop || res.cutBottom;
+    if (!partial) {
+      if (res.covered < 2) return;
+    } else if (res.covered < CODE_BLOCK_PARTIAL_MIN_CHARS) {
+      if (cutTopMidLine || res.cutMidLine || res.covered < CODE_BLOCK_PARTIAL_LINE_MIN_CHARS) return;
+    }
+    candidates.push({ block: p.b, key: p.raw, startRow: start, endRow: res.end - 1, cutTop, cutBottom: res.cutBottom });
+  };
+
+  for (let r = 0; r < rc.length; r++) {
+    const row = rc[r];
+    if (!row) continue;
+    const topEdge = isTopEdge(r - 1);
+    // Claude draws a blank row before a block that starts below other text,
+    // so a blank row above means the block started there, unless the block
+    // itself has a blank line there: then the rows may be the part of a block
+    // scrolled to just below one of its own blank lines.
+    const topEdgeAfterBlank = !topEdge && r >= 1 && rc[r - 1] === '' && isTopEdge(r - 2);
+    for (const p of prepared) {
+      if (p.lines[0].startsWith(row)) consider(p, r, run(p, 0, r), false);
+      if (!topEdge && !topEdgeAfterBlank) continue;
+      // Cut off at the top: the first visible row may be any later line, or
+      // any stretch of a wrapped line whose start is above the screen.
+      for (let k = 0; k < p.lines.length; k++) {
+        const line = p.lines[k];
+        for (let at = line.indexOf(row, k === 0 ? 1 : 0); at >= 0; at = line.indexOf(row, at + 1)) {
+          if (!topEdge && !(at === 0 && k > 0 && !p.lines[k - 1])) continue;
+          consider(p, r, run(p, k, r, line.slice(0, at)), true, at > 0);
+        }
+      }
+    }
+  }
+
+  // Rows that match more than one block are settled in two passes. Complete
+  // matches go first, longest first, except one that a partial match of a
+  // different block strictly contains: that complete match is skipped and its
+  // rows stay free for the partial pass, because the longer block, cut off by
+  // the screen edge, explains every row the shorter one does and more. The
+  // containing partial wins only when no other blocks explain its extra rows.
+  // When they do, the screen reads equally as the complete match plus those
+  // blocks, so the rows of both readings get no button. Only blocks with
+  // identical text are interchangeable, so a tie between them is no tie.
+  // Blocks that differ only in indentation or in the amount of whitespace
+  // look the same on screen, and nothing there says which one the rows show,
+  // so their rows get no button: a missing button costs less than copying the
+  // wrong block. A partial match of a different block on exactly the same rows
+  // ties too: the rows may be the visible part of that block, cut off by the
+  // screen edge.
+  const taken = new Array(rc.length).fill(false);
+  const isFree = (c) => {
+    for (let r = c.startRow; r <= c.endRow; r++) if (taken[r]) return false;
+    return true;
+  };
+  const take = (c) => {
+    for (let r = c.startRow; r <= c.endRow; r++) taken[r] = true;
+    accepted.push(c);
+  };
+  const accepted = [];
+  const span = (c) => c.endRow - c.startRow;
+  const complete = candidates.filter((c) => !c.cutTop && !c.cutBottom);
+  complete.sort((a, b) => span(b) - span(a) || a.startRow - b.startRow || a.block - b.block);
+  // Whether every non-blank row of partial `o` outside complete match `c` lies
+  // inside a candidate of a block other than `o`'s that keeps clear of `c`'s
+  // rows. The screen then reads equally as `c` plus those blocks, or as `o`.
+  const extraRowsExplained = (o, c) => {
+    for (let r = o.startRow; r <= o.endRow; r++) {
+      if ((r >= c.startRow && r <= c.endRow) || rc[r] === '') continue;
+      const explained = candidates.some(
+        (x) =>
+          x.key !== o.key && (x.endRow < c.startRow || x.startRow > c.endRow) && x.startRow <= r && x.endRow >= r
+      );
+      if (!explained) return false;
+    }
+    return true;
+  };
+  // Identical copies of a block on the same rows are interchangeable, so each
+  // reading (text and rows) is settled once. A later copy would reach the
+  // same answer, and rows the first copy took already fail isFree.
+  const readingId = (c) => c.key + '\0' + c.startRow + '\0' + c.endRow;
+  const settled = new Set();
+  for (const c of complete) {
+    if (!isFree(c)) continue;
+    const id = readingId(c);
+    if (settled.has(id)) continue;
+    settled.add(id);
+    const containing = candidates.filter(
+      (o) =>
+        (o.cutTop || o.cutBottom) &&
+        o.key !== c.key &&
+        o.startRow <= c.startRow &&
+        o.endRow >= c.endRow &&
+        span(o) > span(c)
+    );
+    if (containing.length) {
+      const distinct = new Map();
+      for (const o of containing) if (!distinct.has(readingId(o))) distinct.set(readingId(o), o);
+      const ambiguous = [...distinct.values()].filter((o) => extraRowsExplained(o, c));
+      if (ambiguous.length) {
+        for (const o of [c, ...ambiguous]) for (let r = o.startRow; r <= o.endRow; r++) taken[r] = true;
+      }
+      continue;
+    }
+    const same = candidates.filter((o) => o.startRow === c.startRow && o.endRow === c.endRow);
+    if (new Set(same.map((o) => o.key)).size > 1) {
+      for (let r = c.startRow; r <= c.endRow; r++) taken[r] = true;
+      continue;
+    }
+    take(c);
+  }
+
+  // A cut-off block shows only part of its text, and revised drafts of one
+  // answer (a commit message rewritten turn after turn) share that part. The
+  // screen shows blocks in transcript order, so the nearest complete match on
+  // the far side of the cut picks the version: the latest block before it for
+  // a cut at the top, the earliest block after it for a cut at the bottom.
+  // When no complete match can decide, the rows get no button, because a
+  // missing button costs less than copying the wrong draft.
+  const groups = new Map();
+  for (const c of candidates) {
+    if (!c.cutTop && !c.cutBottom) continue;
+    const id = c.startRow + ':' + c.endRow;
+    if (!groups.has(id)) groups.set(id, []);
+    groups.get(id).push(c);
+  }
+  const ordered = [...groups.values()].sort((a, b) => span(b[0]) - span(a[0]) || a[0].startRow - b[0].startRow);
+  for (const group of ordered) {
+    const first = group[0];
+    if (!isFree(first)) continue;
+    if (new Set(group.map((c) => c.key)).size === 1) {
+      take(first);
+      continue;
+    }
+    let pick = null;
+    if (first.cutTop && !first.cutBottom) {
+      const below = accepted.filter((a) => a.startRow > first.endRow && !a.cutTop).sort((a, b) => a.startRow - b.startRow)[0];
+      if (below) pick = group.filter((c) => c.block < below.block).sort((a, b) => b.block - a.block)[0];
+    } else if (first.cutBottom && !first.cutTop) {
+      const above = accepted.filter((a) => a.endRow < first.startRow && !a.cutBottom).sort((a, b) => b.endRow - a.endRow)[0];
+      if (above) pick = group.filter((c) => c.block > above.block).sort((a, b) => a.block - b.block)[0];
+    }
+    if (pick) take(pick);
+  }
+  return accepted
+    .sort((a, b) => a.startRow - b.startRow)
+    .map((c) => ({ block: c.block, startRow: c.startRow, endRow: c.endRow, partial: c.cutTop || c.cutBottom }));
+}
+
 // ── Markdown heading anchors ────────────────────────────────────────────────
 // marked emits no `id` on headings, so a rendered document's own `[Install](#installation)` links had
 // nothing to jump to. And with `<base href="/">` a bare `#installation` href points at the dashboard's
@@ -1584,6 +1994,12 @@ if (typeof window !== 'undefined') {
   };
   window.CodemanCopySelection = {
     clean: cleanCopiedSelection,
+  };
+  window.CodemanCodeBlockCopy = {
+    compact: compactCodeText,
+    extract: extractMarkdownCodeBlocks,
+    match: matchCodeBlocksInRows,
+    PARTIAL_MIN_CHARS: CODE_BLOCK_PARTIAL_MIN_CHARS,
   };
   window.CodemanMarkdownAnchors = {
     slug: markdownHeadingSlug,

@@ -8,7 +8,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCookie from '@fastify/cookie';
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { installRouteErrorHandler } from '../../src/web/route-error-handler.js';
@@ -431,6 +432,144 @@ describe('GET /api/sessions/:id/last-response (claude)', () => {
       ['user', 2],
       ['assistant', 2],
     ]);
+  });
+});
+
+/**
+ * The terminal's code-block Copy button polls `context=full` while a turn runs.
+ * A conditional request lets the server skip the read and parse of a transcript
+ * that has not changed since the caller's last copy.
+ */
+describe('GET /api/sessions/:id/last-response (claude ETag)', () => {
+  let harness: LocalHarness;
+  let testHome: string;
+  let previousHome: string | undefined;
+  let sessionId: string;
+  let transcriptPath: string;
+
+  beforeEach(async () => {
+    testHome = mkdtempSync(join(tmpdir(), 'codeman-claude-etag-'));
+    previousHome = process.env.HOME;
+    process.env.HOME = testHome;
+    harness = await createEnvelopeHarness();
+    sessionId = harness.ctx._session.id;
+    const session = harness.ctx._session as typeof harness.ctx._session & {
+      claudeSessionId: string;
+      adoptClaudeSessionId: ReturnType<typeof vi.fn>;
+    };
+    session.claudeSessionId = sessionId;
+    session.adoptClaudeSessionId = vi.fn();
+    const projectDir = join(testHome, '.claude', 'projects', '-workspace');
+    mkdirSync(projectDir, { recursive: true });
+    transcriptPath = join(projectDir, `${sessionId}.jsonl`);
+    writeFileSync(
+      transcriptPath,
+      [userEntry('go'), assistantEntry('Done.', '2026-07-21T00:00:01Z')].map((e) => JSON.stringify(e)).join('\n')
+    );
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    rmSync(testHome, { recursive: true, force: true });
+    await harness.app.close();
+  });
+
+  const get = (query: string, headers: Record<string, string> = {}) =>
+    harness.app.inject({ method: 'GET', url: `/api/sessions/${sessionId}/last-response${query}`, headers });
+
+  it('carries an ETag on a 200', async () => {
+    const response = await get('?context=full');
+    expect(response.statusCode).toBe(200);
+    expect(response.headers.etag).toMatch(/^"[0-9a-f]{40}"$/);
+  });
+
+  it('answers a matching If-None-Match with an empty 304 without reading the transcript', async () => {
+    const first = await get('?context=full');
+    const etag = first.headers.etag as string;
+    const readFile = vi.spyOn(fsPromises, 'readFile');
+
+    const repeat = await get('?context=full', { 'if-none-match': etag });
+
+    expect(repeat.statusCode).toBe(304);
+    expect(repeat.body).toBe('');
+    expect(repeat.headers.etag).toBe(etag);
+    expect(readFile).not.toHaveBeenCalledWith(transcriptPath, 'utf8');
+
+    // The spy does see the route's read, so the assertion above is not vacuous.
+    await get('?context=full');
+    expect(readFile).toHaveBeenCalledWith(transcriptPath, 'utf8');
+  });
+
+  it('changes the ETag and answers 200 once a row is appended', async () => {
+    const first = await get('?context=full');
+    const etag = first.headers.etag as string;
+    appendFileSync(transcriptPath, '\n' + JSON.stringify(assistantEntry('More.', '2026-07-21T00:00:02Z')));
+
+    const next = await get('?context=full', { 'if-none-match': etag });
+
+    expect(next.statusCode).toBe(200);
+    expect(next.headers.etag).not.toBe(etag);
+    expect(JSON.parse(next.body).data.text).toBe('More.');
+  });
+
+  it('gives context=turn and context=full different ETags', async () => {
+    const full = await get('?context=full');
+    const turn = await get('?context=turn');
+    expect(full.headers.etag).not.toBe(turn.headers.etag);
+
+    const crossed = await get('?context=turn', { 'if-none-match': full.headers.etag as string });
+    expect(crossed.statusCode).toBe(200);
+  });
+
+  it('changes the ETag when a new server process serves the same unchanged transcript', async () => {
+    const first = await get('?context=full');
+    const etag = first.headers.etag as string;
+
+    // A second harness stands in for the server after a restart or upgrade.
+    const restarted = await createEnvelopeHarness();
+    try {
+      const session = restarted.ctx._session as typeof restarted.ctx._session & {
+        claudeSessionId: string;
+        adoptClaudeSessionId: ReturnType<typeof vi.fn>;
+      };
+      session.claudeSessionId = sessionId;
+      session.adoptClaudeSessionId = vi.fn();
+
+      const response = await restarted.app.inject({
+        method: 'GET',
+        url: `/api/sessions/${restarted.ctx._session.id}/last-response?context=full`,
+        headers: { 'if-none-match': etag },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers.etag).toMatch(/^"[0-9a-f]{40}"$/);
+      expect(response.headers.etag).not.toBe(etag);
+    } finally {
+      await restarted.app.close();
+    }
+  });
+
+  it('sends no ETag with the empty list it answers when the transcript read fails', async () => {
+    const readFile = vi.spyOn(fsPromises, 'readFile').mockRejectedValueOnce(new Error('EIO'));
+
+    const response = await get('?context=full');
+
+    // The failed read is the route's own transcript read, not some earlier one.
+    expect(readFile.mock.calls[0][0]).toBe(transcriptPath);
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body).data.messages).toEqual([]);
+    expect(response.headers.etag).toBeUndefined();
+  });
+
+  it('answers a request without If-None-Match as before', async () => {
+    const response = await get('');
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body)).toEqual({
+      success: true,
+      data: { text: 'Done.', timestamp: '2026-07-21T00:00:01Z' },
+    });
   });
 });
 

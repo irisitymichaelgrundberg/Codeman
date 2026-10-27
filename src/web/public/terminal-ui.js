@@ -741,6 +741,7 @@ Object.assign(CodemanApp.prototype, {
     this._initMobileImePreview();
     this._installMobileTapMouseGuard();
     this._installShiftDragSelection();
+    this._installCodeBlockCopy();
     this._installTouchSelectionFocusGuard();
     // Focus coming back to the primary terminal ends a second pane's claim on
     // the keyboard (see _focusedPane).
@@ -6225,6 +6226,312 @@ Object.assign(CodemanApp.prototype, {
       },
       true
     );
+  },
+
+  /**
+   * Code-block copy on hover (per-device `terminalCodeCopy`, default OFF).
+   *
+   * Hovering a code block from the agent's answer shows the Response Viewer's
+   * Copy button at the block's top-right corner, and the button copies the
+   * block as the TRANSCRIPT has it. The screen has no fences, so the blocks
+   * come from `last-response?context=full` and are located on screen by text
+   * (`CodemanCodeBlockCopy.match`, constants.js). Only the visible rows are
+   * matched, which is all a fullscreen renderer keeps in xterm anyway.
+   *
+   * ⚠️ A response the server segmented from the terminal pane (`source:
+   * 'pane'`) gets no button: its text is screen text, so a block lexed from it
+   * would copy what is already on screen. Only a CLI that keeps a markdown
+   * transcript file gets the button.
+   * ⚠️ Desktop only: it needs a hovering pointer, and a phone's long-press
+   * already selects text.
+   * ⚠️ The button lives in #terminalContainer, outside `.xterm`, so a click on
+   * it never reaches xterm as a selection start or a mouse report.
+   */
+  _installCodeBlockCopy() {
+    const container = document.getElementById('terminalContainer');
+    const term = this.terminal;
+    if (!container || !term || container._codemanCodeCopyInstalled) return;
+    container._codemanCodeCopyInstalled = true;
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'rv-copy-btn terminal-code-copy-btn';
+    btn.setAttribute('aria-label', 'Copy code block');
+    btn.title = 'Copy code block';
+    btn.hidden = true;
+    container.appendChild(btn);
+    this._codeCopyBtn = btn;
+    this._codeCopyCache = new Map(); // sessionId -> { blocks, fetchedAt, loading }
+    this._codeCopyScreenGen = 0;
+
+    // Output can repaint the screen many times a second while a turn
+    // streams, so updates that output drives run at most this often.
+    const CODE_COPY_OUTPUT_THROTTLE_MS = 150;
+    const schedule = () => {
+      if (this._codeCopyFrame) return;
+      this._codeCopyFrame = requestAnimationFrame(() => {
+        this._codeCopyFrame = 0;
+        this._updateCodeBlockCopy();
+      });
+    };
+    const scheduleAfterOutput = () => {
+      if (this._codeCopyOutputTimer) return;
+      this._codeCopyOutputTimer = setTimeout(() => {
+        this._codeCopyOutputTimer = 0;
+        schedule();
+      }, CODE_COPY_OUTPUT_THROTTLE_MS);
+    };
+    // Only pointer movement may refetch a stale block list, so a pointer
+    // resting over the terminal through a turn costs no transcript reads.
+    container.addEventListener('mousemove', (ev) => {
+      this._codeCopyPointer = { x: ev.clientX, y: ev.clientY, buttons: ev.buttons };
+      this._codeCopyPointerMoved = true;
+      schedule();
+    });
+    container.addEventListener('mouseleave', () => {
+      this._codeCopyPointer = null;
+      schedule();
+    });
+    container.addEventListener(
+      'wheel',
+      () => {
+        this._codeCopyPointerMoved = true;
+        schedule();
+      },
+      { passive: true }
+    );
+    // Every repaint can move or replace what is on screen, and the transcript
+    // may also have grown. A repaint marks the block list stale, and the next
+    // pointer movement over the terminal refetches it, at most once every
+    // three seconds.
+    term.onWriteParsed(() => {
+      this._codeCopyScreenGen++;
+      const entry = this._codeCopyCache.get(this.activeSessionId);
+      if (entry) entry.stale = true;
+      if (this._codeCopyPointer) scheduleAfterOutput();
+    });
+    // Output scrolls the viewport on every new line, so this is throttled
+    // too; a user's own scrolling updates at once through the wheel listener.
+    term.onScroll(() => {
+      this._codeCopyScreenGen++;
+      scheduleAfterOutput();
+    });
+    term.onResize(() => {
+      this._codeCopyScreenGen++;
+      schedule();
+    });
+
+    // mousedown would otherwise move focus off the terminal.
+    btn.addEventListener('mousedown', (ev) => ev.preventDefault());
+    btn.addEventListener('click', async (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const text = btn._codeText;
+      let ok = false;
+      if (typeof text === 'string' && text) {
+        // _copyText's execCommand fallback focuses a temporary textarea and
+        // removes it, which leaves focus on the page body; give it back.
+        const focusedBefore = document.activeElement;
+        ok = await this._copyText(text);
+        if (
+          focusedBefore &&
+          focusedBefore !== document.activeElement &&
+          focusedBefore.isConnected &&
+          typeof focusedBefore.focus === 'function'
+        ) {
+          try {
+            focusedBefore.focus();
+          } catch {}
+        }
+      }
+      this._flashCopyResult(btn, ok);
+    });
+  },
+
+  _codeBlockCopyEnabled() {
+    try {
+      if (this.loadAppSettingsFromStorage?.()?.terminalCodeCopy !== true) return false;
+    } catch {
+      return false;
+    }
+    return !!window.matchMedia?.('(hover: hover) and (pointer: fine)').matches;
+  },
+
+  /**
+   * The code blocks of the agent's messages in the active session's
+   * conversation, or null while the first fetch is in flight. A repaint marks the list stale. A stale list
+   * keeps serving, and it is refetched only when `allowRefetch` is set, which
+   * the caller does after the pointer moved, at most once every three seconds.
+   * The first fetch for a session runs from any caller.
+   */
+  _codeBlockCopyBlocks(allowRefetch) {
+    const id = this.activeSessionId;
+    if (!id) return null;
+    // A remote session's transcript lives on the remote host. The server's
+    // Codex lookup still searches this machine's rollouts and can pick a local
+    // conversation that shares the session's directory, so a remote session
+    // offers no blocks and is never fetched for.
+    if (this.sessions?.get(id)?.remote) return [];
+    let entry = this._codeCopyCache.get(id);
+    const REFETCH_MS = 3000;
+    const due =
+      !entry ||
+      (allowRefetch && !entry.pane && entry.stale && !entry.loading && Date.now() - entry.fetchedAt > REFETCH_MS);
+    if (due) {
+      if (!entry) {
+        entry = { blocks: null, fetchedAt: 0, loading: false, stale: true };
+        this._codeCopyCache.set(id, entry);
+        // A handful of sessions is plenty: one list per tab the user hovers.
+        while (this._codeCopyCache.size > 8) this._codeCopyCache.delete(this._codeCopyCache.keys().next().value);
+      }
+      entry.loading = true;
+      entry.stale = false;
+      // A Claude transcript answers with an ETag. Sending it back gets a 304
+      // with no body until the transcript changes, which spares the server the
+      // read and parse. It is sent only with a list in hand, so a 304 always
+      // has blocks to keep. `no-store` keeps the browser's HTTP cache from
+      // answering in the server's place.
+      const headers = {};
+      if (entry.etag && entry.blocks) headers['If-None-Match'] = entry.etag;
+      let etag = null;
+      fetch(`/api/sessions/${encodeURIComponent(id)}/last-response?context=full`, { cache: 'no-store', headers })
+        .then((res) => {
+          if (res.status === 304) return null;
+          if (!res.ok) throw new Error(`last-response ${res.status}`);
+          etag = res.headers?.get?.('ETag') || null;
+          return res.json();
+        })
+        .then((json) => {
+          // A 304 keeps the same list, and the same array, so the matcher's
+          // cache of the prepared list stays valid.
+          if (json === null) return;
+          const data = json?.data ?? json ?? {};
+          // Text segmented from the pane is screen text, not the transcript's
+          // markdown, so it offers nothing worth copying from. A session that
+          // answers from the pane keeps doing so, so it is never refetched.
+          if (data.source === 'pane') {
+            entry.blocks = [];
+            entry.pane = true;
+            return;
+          }
+          const lex = typeof marked !== 'undefined' && marked.lexer ? (t) => marked.lexer(t) : null;
+          // Only the newest messages change between fetches, so each message's
+          // blocks are kept by its text and only new text is lexed. The memo is
+          // rebuilt from this response, so it never outgrows the conversation.
+          const previous = entry.blocksByText;
+          const byText = new Map();
+          const blocks = [];
+          for (const message of Array.isArray(data.messages) ? data.messages : []) {
+            // The user's own prompts are not the agent's output, so a fenced
+            // block the user typed gets no button.
+            if (message?.role === 'user') continue;
+            const text = typeof message?.text === 'string' ? message.text : '';
+            let found = byText.get(text) ?? previous?.get(text);
+            if (!found) found = window.CodemanCodeBlockCopy.extract([message], lex);
+            // Without marked every message yields nothing; remember none of it.
+            if (lex) byText.set(text, found);
+            blocks.push(...found);
+          }
+          entry.blocksByText = byText;
+          // A new array every time, since the matcher caches by array identity.
+          entry.blocks = blocks;
+          entry.etag = etag;
+        })
+        .catch(() => {
+          if (!entry.blocks) entry.blocks = [];
+          // Keep the last good list, and let the next pointer movement retry after REFETCH_MS.
+          entry.stale = true;
+        })
+        .finally(() => {
+          entry.loading = false;
+          entry.fetchedAt = Date.now();
+          this._codeCopyScreenGen++;
+          if (this._codeCopyPointer && id === this.activeSessionId) this._updateCodeBlockCopy();
+        });
+    }
+    return entry.blocks;
+  },
+
+  /** Show, move or hide the button for the block under the pointer. */
+  _updateCodeBlockCopy() {
+    const btn = this._codeCopyBtn;
+    const term = this.terminal;
+    if (!btn || !term) return;
+    const hide = () => {
+      btn.hidden = true;
+      btn._codeText = null;
+      btn._codeSessionId = null;
+    };
+    const pointerMoved = !!this._codeCopyPointerMoved;
+    this._codeCopyPointerMoved = false;
+    const p = this._codeCopyPointer;
+    // A held button is a drag-selection in progress; stay out of its way.
+    if (!p || p.buttons || !this._codeBlockCopyEnabled()) return hide();
+    // A pointer resting on the button keeps it, but only over the session it
+    // was shown for: after a tab switch it would copy the old session's block.
+    if (btn._codeSessionId === this.activeSessionId && btn.contains(document.elementFromPoint(p.x, p.y))) return;
+    const cellPos = this._clientPointToCell(p.x, p.y);
+    if (!cellPos) return hide();
+    const blocks = this._codeBlockCopyBlocks(pointerMoved);
+    if (!blocks || blocks.length === 0) return hide();
+
+    const buf = term.buffer.active;
+    const key = `${this.activeSessionId}:${this._codeCopyScreenGen}:${buf.viewportY}:${blocks.length}`;
+    if (this._codeCopyMatchKey !== key) {
+      const rows = [];
+      for (let y = 0; y < term.rows; y++) rows.push(buf.getLine(buf.viewportY + y)?.translateToString(true) ?? '');
+      this._codeCopyMatches = window.CodemanCodeBlockCopy.match(rows, blocks);
+      this._codeCopyMatchKey = key;
+    }
+    const row = cellPos.row - 1;
+    const m = this._codeCopyMatches.find((x) => x.startRow <= row && row <= x.endRow);
+    if (!m) return hide();
+
+    const screen = term.element?.querySelector('.xterm-screen');
+    const cell = term._core?._renderService?.dimensions?.css?.cell;
+    if (!screen || !cell?.width) return hide();
+    // The block's width is measured in terminal cells, not characters, since a
+    // wide (CJK) character fills two cells. The scan skips blank cells, because
+    // translateToString(true) trims only cells never written to, and Claude's
+    // fullscreen renderer pads its rows with real spaces.
+    const rowCells = (line) => {
+      if (!line) return 0;
+      for (let x = line.length - 1; x >= 0; x--) {
+        const c = line.getCell(x);
+        if (c && c.getWidth() > 0 && c.getChars().trim()) return x + c.getWidth();
+      }
+      return 0;
+    };
+    let widest = 0;
+    for (let y = m.startRow; y <= m.endRow; y++) widest = Math.max(widest, rowCells(buf.getLine(buf.viewportY + y)));
+    const sRect = screen.getBoundingClientRect();
+    const host = btn.parentElement;
+    const cRect = host.getBoundingClientRect();
+    // The container scrolls sideways while .term-overflows-x is set, and an
+    // absolute child moves with the scrolled content, so viewport offsets get
+    // the scroll added back. The button also stays inside the container's
+    // visible part, on both sides, not just inside the xterm screen, which may
+    // be wider.
+    const scrollX = host.scrollLeft || 0;
+    const scrollY = host.scrollTop || 0;
+    const btnWidth = btn.offsetWidth || 28;
+    const visibleRight = Math.min(sRect.right, host.clientWidth ? cRect.left + host.clientWidth : cRect.right);
+    const left =
+      Math.max(Math.min(sRect.left + (widest + 1) * cell.width, visibleRight - btnWidth - 4), cRect.left + 4) -
+      cRect.left +
+      scrollX;
+    btn.style.left = `${Math.round(left)}px`;
+    btn.style.top = `${Math.round(sRect.top - cRect.top + scrollY + m.startRow * cell.height)}px`;
+    if (btn._codeText !== blocks[m.block].text) btn.classList.remove('rv-copied', 'rv-copy-failed');
+    btn._codeText = blocks[m.block].text;
+    btn._codeSessionId = this.activeSessionId;
+    // Translated at show time, so a live language switch reaches the button.
+    const label = typeof window.codemanT === 'function' ? window.codemanT('Copy code block') : 'Copy code block';
+    if (btn.title !== label) {
+      btn.title = label;
+      btn.setAttribute('aria-label', label);
+    }
+    btn.hidden = false;
   },
 
   _installMobileTapMouseGuard() {

@@ -657,6 +657,10 @@
     'Gesture Control (beta)': '手势控制（测试版）',
     'Wheel Scrolls Local History': '滚轮滚动本地历史',
     'Auto Copy Selection': '自动复制选中内容',
+    'Copy Button on Code Blocks': '代码块复制按钮',
+    'Copy code block': '复制代码块',
+    "Hovering a code block in the agent's answer shows a Copy button, like the one in the Response Viewer. It copies the block exactly as the agent wrote it, without the terminal's margin or line wrapping. Works for Claude Code and Codex, except in remote sessions, and for DeepSeek outside Docker and remote sessions.":
+      '将鼠标悬停在智能体回复中的代码块上时，会显示与回复查看器中相同的复制按钮。它按智能体写出的原样复制代码块，不包含终端的边距和自动换行。适用于 Claude Code 和 Codex（远程会话除外），以及 Docker 和远程会话之外的 DeepSeek。',
     'Selection & clipboard': '选中与剪贴板',
     'Auto Copy: selection copied': '自动复制：已复制选中内容',
     'Auto Copy failed: the browser blocked clipboard access': '自动复制失败：浏览器阻止了剪贴板访问',

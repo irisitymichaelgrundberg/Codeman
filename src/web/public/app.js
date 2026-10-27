@@ -2874,12 +2874,7 @@ class CodemanApp {
         ev.stopPropagation();
         const code = copyBtn.closest('.rv-code-wrap')?.querySelector('pre code');
         const ok = code ? await this._copyText(code.textContent || '') : false;
-        copyBtn.classList.remove('rv-copied', 'rv-copy-failed');
-        copyBtn.classList.add(ok ? 'rv-copied' : 'rv-copy-failed');
-        clearTimeout(copyBtn._resetTimer);
-        copyBtn._resetTimer = setTimeout(() => {
-          copyBtn.classList.remove('rv-copied', 'rv-copy-failed');
-        }, 1500);
+        this._flashCopyResult(copyBtn, ok);
         return;
       }
 
@@ -2921,6 +2916,20 @@ class CodemanApp {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Flash a Copy button's result for 1.5 s: `rv-copied` on success,
+   * `rv-copy-failed` otherwise. Shared by the Response Viewer's code blocks
+   * and the terminal's code-block Copy button, so both give the same feedback.
+   */
+  _flashCopyResult(btn, ok) {
+    btn.classList.remove('rv-copied', 'rv-copy-failed');
+    btn.classList.add(ok ? 'rv-copied' : 'rv-copy-failed');
+    clearTimeout(btn._resetTimer);
+    btn._resetTimer = setTimeout(() => {
+      btn.classList.remove('rv-copied', 'rv-copy-failed');
+    }, 1500);
   }
 
   /** Build one response-viewer message so the brief and full views share markup and CSS. */

@@ -14925,6 +14925,15 @@ html:is([data-skin="paper-gray"], [data-skin="solarized-light"], [data-skin="cat
 .rv-copy-btn.rv-copy-failed { color: var(--red); border-color: var(--red); }
 .rv-copy-btn.rv-copy-failed::before { content: '\2715'; } /* ✕ */
 
+/* The same button on a code block in the terminal (_installCodeBlockCopy).
+   Above the local-echo overlay (7), below the touch-selection bar (900). */
+.terminal-code-copy-btn {
+  position: absolute;
+  z-index: 8;
+}
+/* .rv-copy-btn sets display, which would otherwise beat the attribute. */
+.terminal-code-copy-btn[hidden] { display: none; }
+
 .rv-text ul, .rv-text ol,
 .response-viewer-body > ul, .response-viewer-body > ol {
   margin: 0.6em 0;

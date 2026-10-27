@@ -12,7 +12,7 @@ import { existsSync, statSync, mkdirSync, writeFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import { finished } from 'node:stream/promises';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { isUtf8 } from 'node:buffer';
 import { performance } from 'node:perf_hooks';
 import {
@@ -2845,7 +2845,10 @@ export function registerSessionRoutes(
     return candidates[0] ?? null;
   }
 
-  app.get('/api/sessions/:id/last-response', async (req) => {
+  // Mixed into every last-response ETag; see the comment at the hash below.
+  const lastResponseEtagSalt = randomBytes(8).toString('hex');
+
+  app.get('/api/sessions/:id/last-response', async (req, reply) => {
     const { id } = req.params as { id: string };
     const session = findSessionOrFail(ctx, id, req);
 
@@ -2906,6 +2909,8 @@ export function registerSessionRoutes(
         timestamp: '',
         hasContext: blocks.length > 0,
         messages: externalQuery.context === 'full' ? blocks : undefined,
+        // Marks text segmented from the terminal pane rather than read from a transcript file.
+        source: 'pane',
       };
     }
 
@@ -2954,8 +2959,25 @@ export function registerSessionRoutes(
     }
 
     try {
+      // A conditional request skips the read and the parse. Appending a row
+      // changes the transcript's size and mtime, so the path, size and mtime,
+      // with the context value that picks the view, identify one response body.
+      // The terminal's code-block Copy button re-sends the ETag and gets a 304
+      // until the transcript changes. The hash does not cover how the body is
+      // derived from the file, so a per-process salt changes every ETag on each
+      // server start, which is what invalidates validators across an upgrade.
+      const stat = await fs.stat(transcript.path);
+      const etag = `"${createHash('sha1')
+        .update(`${transcript.path}\0${stat.size}\0${stat.mtimeMs}\0${query.context ?? ''}\0${lastResponseEtagSalt}`)
+        .digest('hex')}"`;
+      if (req.headers['if-none-match'] === etag) {
+        reply.header('ETag', etag);
+        return reply.code(304).send();
+      }
       const content = await fs.readFile(transcript.path, 'utf8');
       const parsed = parseClaudeResponseTranscript(content, wantsMessages);
+      // Set only once the parse succeeded, so the empty fallback below never carries a validator.
+      reply.header('ETag', etag);
       if (query.context === 'turn') {
         return {
           text: parsed.text,
