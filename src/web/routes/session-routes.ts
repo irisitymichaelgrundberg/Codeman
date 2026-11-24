@@ -17,6 +17,13 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { isUtf8 } from 'node:buffer';
 import { performance } from 'node:perf_hooks';
 import {
+  CLAUDE_BUILTIN_COMMANDS,
+  mergeSlashCommands,
+  parseSkillListings,
+  type SlashCommand,
+} from '../../claude-slash-commands.js';
+import { readSlashCommandFiles } from '../../claude-slash-command-files.js';
+import {
   ApiErrorCode,
   createErrorResponse,
   getErrorMessage,
@@ -230,6 +237,7 @@ import {
 import { readDeepSeekLastResponse } from '../../deepseek-transcript.js';
 import { appendClaudeCustomTitle } from '../../claude-session-title.js';
 import { UPLOADS_DIR } from '../paste-image-gc.js';
+import { KEEP_WARM_NUDGE } from '../../prompt-cache-keepwarm.js';
 
 // Path to linked-cases registry (same file used by case-routes resolveCasePath)
 const LINKED_CASES_FILE = dataPath('linked-cases.json');
@@ -2944,6 +2952,11 @@ export function registerSessionRoutes(
     timestamp?: string;
     turn: number;
     queued?: boolean;
+    /**
+     * Part of a keep-warm turn (prompt-cache-keepwarm.ts): Codeman sent the prompt, not the user,
+     * and the reply is its "ok". The chat view leaves such turns out, as Read My Mind does.
+     */
+    keepAlive?: boolean;
   }
 
   interface ClaudeTranscriptEntry {
@@ -3016,13 +3029,23 @@ export function registerSessionRoutes(
     const currentAssistantFragments = new Set<string>();
     // Turn 0 is reserved for anything emitted before the first human prompt.
     let turn = 0;
+    // Whether the current turn opened with Codeman's keep-warm nudge.
+    let keepAliveTurn = false;
 
     const pushUserMessage = (text: string, timestamp: string | undefined, queued: boolean): void => {
       // A run of consecutive human inputs (a mid-turn queued burst) is ONE turn,
       // so the viewer renders it under one badge instead of one badge per line.
-      if (messages.at(-1)?.role !== 'user') turn += 1;
+      const isNudge = text === KEEP_WARM_NUDGE;
+      if (messages.at(-1)?.role !== 'user') {
+        turn += 1;
+        keepAliveTurn = isNudge;
+      } else if (!isNudge) {
+        // A prompt the user queued during the keep-warm turn makes the turn theirs.
+        keepAliveTurn = false;
+      }
       const message: ClaudeResponseMessage = { kind: 'prompt', label: 'Prompt', role: 'user', text, timestamp, turn };
       if (queued) message.queued = true;
+      if (isNudge) message.keepAlive = true;
       messages.push(message);
       currentUserFragments.add(text);
       currentAssistantFragments.clear();
@@ -3083,7 +3106,16 @@ export function registerSessionRoutes(
 
       // Replayed snapshots repeat an identical text block inside one turn.
       if (currentAssistantFragments.has(text)) continue;
-      messages.push({ kind: 'response', label: 'Response', role: 'assistant', text, timestamp: entry.timestamp, turn });
+      const response: ClaudeResponseMessage = {
+        kind: 'response',
+        label: 'Response',
+        role: 'assistant',
+        text,
+        timestamp: entry.timestamp,
+        turn,
+      };
+      if (keepAliveTurn) response.keepAlive = true;
+      messages.push(response);
       currentAssistantFragments.add(text);
       currentUserFragments.clear();
     }
@@ -3340,6 +3372,14 @@ export function registerSessionRoutes(
       }
     }
 
+    // The chat view lives on the watcher's events (tool starts, new lines). A watcher normally
+    // starts at the session's first hook, so a session the server picked up mid-turn (a restart)
+    // has none until its next prompt or turn end. Start one from the file just found. Only when
+    // none runs: the hook's path stays the authority, and a remote session's file is not here.
+    if (context === 'full' && !session.remote && ctx.getTranscriptPath(session.id) === null) {
+      ctx.startTranscriptWatcher(session.id, transcript.path);
+    }
+
     try {
       const content = await fs.readFile(transcript.path, 'utf8');
       const parsed = parseClaudeResponseTranscript(content, wantsMessages);
@@ -3361,6 +3401,54 @@ export function registerSessionRoutes(
     const { id } = req.params as { id: string };
     const session = findSessionOrFail(ctx, id, req);
     return lastResponseFor(session, (req.query as { context?: string }).context);
+  });
+
+  // The skills a transcript lists, kept per file while its size and mtime stand, so a `/` typed
+  // twice does not read a long transcript twice.
+  const skillListingCache = new LRUMap<string, { size: number; mtimeMs: number; skills: SlashCommand[] }>({
+    maxSize: 32,
+  });
+
+  async function transcriptSkills(path: string): Promise<SlashCommand[]> {
+    const stat = await fs.stat(path).catch(() => null);
+    if (!stat?.isFile()) return [];
+    const cached = skillListingCache.get(path);
+    if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) return cached.skills;
+    const skills = parseSkillListings(await fs.readFile(path, 'utf8').catch(() => ''));
+    skillListingCache.set(path, { size: stat.size, mtimeMs: stat.mtimeMs, skills });
+    return skills;
+  }
+
+  /**
+   * GET /api/sessions/:id/slash-commands: what the chat view's `/` menu offers for a session
+   * whose CLI writes a Claude-format transcript (claude-slash-commands.ts names the sources).
+   * Any other session answers an empty list. Read-only, and every read is bounded.
+   */
+  app.get('/api/sessions/:id/slash-commands', async (req) => {
+    const { id } = req.params as { id: string };
+    const session = findSessionOrFail(ctx, id, req);
+    if (getCli(session.mode)?.capabilities.transcript !== 'claude-jsonl' || session.isAdopted || session.remote) {
+      return { success: true, data: { commands: [] } };
+    }
+
+    let listed: SlashCommand[] = [];
+    const dirs = await claudeConversationDirs(session);
+    const hookPath = ctx.getTranscriptPath(session.id);
+    const transcriptPath =
+      hookPath ??
+      (dirs
+        ? (await findClaudeTranscript(dirs.projectsDir, session.claudeSessionId || session.id, session.id))?.path
+        : null);
+    if (transcriptPath) listed = await transcriptSkills(transcriptPath);
+
+    // The workspace's own `.claude` first, then the user's config folder. A Docker session's
+    // config folder is the container's, so only its bind-mounted workspace is read here.
+    const roots: string[] = [];
+    if ((await probePathKind(session.workingDir)) === 'directory') roots.push(join(session.workingDir, '.claude'));
+    if (dirs && !session.docker) roots.push(dirname(dirs.projectsDir));
+    const onDisk = await readSlashCommandFiles(roots);
+
+    return { success: true, data: { commands: mergeSlashCommands(listed, onDisk, [...CLAUDE_BUILTIN_COMMANDS]) } };
   });
 
   function isCodexInjectedContext(text: string): boolean {

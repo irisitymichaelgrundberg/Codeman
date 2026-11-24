@@ -1514,6 +1514,288 @@ function findMarkdownAnchorTarget(root, href) {
   return null;
 }
 
+// ─── Chat view (chat-view.js) ─────────────────────────────────────────────────
+// Pure halves of the chat view, the rendered conversation that replaces the terminal
+// as a session's main view (docs/chat-view-plan.md). The module owns the DOM; these
+// decide what it shows, so a test can pin them without a browser.
+
+/** A prompt longer than this many lines, or characters, is folded. */
+const CHAT_PROMPT_FOLD_LINES = 12;
+const CHAT_PROMPT_FOLD_CHARS = 2400;
+/** What a folded prompt still shows. */
+const CHAT_PROMPT_HEAD_LINES = 6;
+const CHAT_PROMPT_HEAD_CHARS = 800;
+
+/**
+ * The messages the chat view draws, in order: prompts and answers with text, without
+ * the keep-warm turns Codeman sends on its own (`keepAlive`, set by the transcript reader).
+ */
+function chatViewVisibleMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+  return messages.filter(
+    (m) =>
+      !!m &&
+      (m.role === 'user' || m.role === 'assistant') &&
+      typeof m.text === 'string' &&
+      m.text.trim() !== '' &&
+      m.keepAlive !== true
+  );
+}
+
+/** Identity of a drawn message: a transcript row never changes once written. */
+function chatViewMessageKey(m) {
+  return `${m.role}\u0000${typeof m.turn === 'number' ? m.turn : ''}\u0000${m.queued ? 'q' : ''}\u0000${m.text}`;
+}
+
+/**
+ * How to bring the drawn thread up to date. `none` when nothing changed, `append`
+ * when the new list only adds messages after the drawn ones (the usual case while a
+ * turn runs), else `replace` (a `/clear`, a rewritten transcript, another session).
+ */
+function chatViewRenderPlan(drawnKeys, nextKeys) {
+  const drawn = Array.isArray(drawnKeys) ? drawnKeys : [];
+  const next = Array.isArray(nextKeys) ? nextKeys : [];
+  if (drawn.length > next.length) return { mode: 'replace' };
+  for (let i = 0; i < drawn.length; i++) {
+    if (drawn[i] !== next[i]) return { mode: 'replace' };
+  }
+  if (drawn.length === next.length) return { mode: 'none' };
+  return { mode: 'append', from: drawn.length };
+}
+
+/**
+ * A prompt as the user wrote it. Claude Code stores a pasted block (which every multi-line
+ * prompt sent through tmux is) inside `<pasted_content id="…">…</pasted_content id="…">` (the
+ * closing tag repeats the id, measured on Claude Code 2.1.331); the markdown
+ * renderer reads that as a raw HTML block and runs its lines together. Only matched pairs are
+ * unwrapped, so a prompt that merely mentions the tag is left alone.
+ */
+function chatViewPromptText(text) {
+  return String(text ?? '').replace(
+    /<pasted_content(?:\s[^>]*)?>\n?([\s\S]*?)\n?<\/pasted_content(?:\s[^>]*)?>/g,
+    (_match, body) => body
+  );
+}
+
+/** A prompt reduced to what two copies of it must share: the text, line breaks as `\n`, trimmed. */
+function chatViewPromptIdentity(text) {
+  return chatViewPromptText(text).replace(/\r\n?/g, '\n').trim();
+}
+
+/** How many user messages in `messages` are the prompt `text`. */
+function chatViewPromptCount(messages, text) {
+  const wanted = chatViewPromptIdentity(text);
+  if (!wanted || !Array.isArray(messages)) return 0;
+  let count = 0;
+  for (const m of messages) {
+    if (m && m.role === 'user' && typeof m.text === 'string' && chatViewPromptIdentity(m.text) === wanted) count++;
+  }
+  return count;
+}
+
+/**
+ * Whether a prompt the chat view drew before it reached the transcript (a pending prompt) can
+ * go, because the transcript now has it. `baseline` is how many copies the transcript held
+ * when it was sent, so sending the same words twice waits for the second copy.
+ */
+function chatViewPendingConfirmed(pending, messages) {
+  return !!pending && chatViewPromptCount(messages, pending.text) > (pending.baseline || 0);
+}
+
+/** Verb phrases for the chat view's status line, by tool name: what the CLI would show. */
+const CHAT_TOOL_VERBS = {
+  Read: 'Reading',
+  NotebookRead: 'Reading',
+  Write: 'Writing',
+  Edit: 'Editing',
+  MultiEdit: 'Editing',
+  NotebookEdit: 'Editing',
+  Bash: 'Running',
+  Grep: 'Searching for',
+  Glob: 'Finding',
+  WebFetch: 'Fetching',
+  WebSearch: 'Searching the web for',
+  Task: 'Running agent:',
+  Agent: 'Running agent:',
+  Skill: 'Using skill',
+};
+
+/**
+ * The status line's account of what the agent is doing: the tool as a verb, and what it works
+ * on (`detail`, from the server's `transcript:tool_start`), with a path inside the session's
+ * folder shown relative to it. A Bash call with a description (`command` set) shows the
+ * description alone. "Working" before the first tool call of a turn.
+ */
+function chatViewActivity(toolName, detail, workingDir, command) {
+  if (!toolName) return 'Working';
+  // A described command: the description is the headline, as in the CLI (the command goes on
+  // the line under it).
+  if (command && typeof detail === 'string' && detail) return detail;
+  if (toolName === 'TodoWrite') return 'Updating the to-do list';
+  let what = typeof detail === 'string' ? detail : '';
+  const base = typeof workingDir === 'string' ? workingDir.replace(/\/+$/, '') : '';
+  if (base && what.startsWith(`${base}/`)) what = what.slice(base.length + 1);
+  const verb = CHAT_TOOL_VERBS[toolName];
+  if (verb) return what ? `${verb} ${what}` : verb.replace(/:$/, '');
+  return what ? `${toolName}: ${what}` : toolName;
+}
+
+/** A running turn's length as the CLI shows it: `14s`, `2m 05s`, `1h 03m`. */
+function chatViewElapsed(ms) {
+  const total = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const sec = total % 60;
+  if (h > 0) return `${h}h ${String(m).padStart(2, '0')}m`;
+  if (m > 0) return `${m}m ${String(sec).padStart(2, '0')}s`;
+  return `${sec}s`;
+}
+
+/** SGR foreground codes the statusline maps onto skin colours; anything else draws in the default. */
+const CHAT_STATUSLINE_COLORS = {
+  30: 'muted',
+  31: 'red',
+  32: 'green',
+  33: 'yellow',
+  34: 'blue',
+  35: 'magenta',
+  36: 'cyan',
+  90: 'muted',
+  91: 'red',
+  92: 'green',
+  93: 'yellow',
+  94: 'blue',
+  95: 'magenta',
+  96: 'cyan',
+};
+
+/**
+ * A statusline's text (the server keeps only SGR colour sequences in it) as lines of styled
+ * segments: `[[{ text, color, bold, dim }]]`. Colours are names the page maps to the skin's own
+ * tokens, so a statusline written for a dark terminal stays readable on a light skin. 256-colour
+ * and true-colour sequences carry no name and draw in the default colour.
+ */
+function chatViewStatusLineSegments(text) {
+  const lines = [];
+  let style = { color: '', bold: false, dim: false };
+  for (const line of String(text ?? '').split('\n')) {
+    const segments = [];
+    const parts = line.split(/\x1b\[([0-9;]*)m/);
+    for (let i = 0; i < parts.length; i++) {
+      if (i % 2 === 0) {
+        if (parts[i]) segments.push({ text: parts[i], ...style });
+        continue;
+      }
+      const codes = parts[i] === '' ? [0] : parts[i].split(';').map(Number);
+      for (let j = 0; j < codes.length; j++) {
+        const code = codes[j];
+        if (code === 0) style = { color: '', bold: false, dim: false };
+        else if (code === 1) style = { ...style, bold: true };
+        else if (code === 2) style = { ...style, dim: true };
+        else if (code === 22) style = { ...style, bold: false, dim: false };
+        else if (code === 39) style = { ...style, color: '' };
+        else if (code === 38 || code === 48) {
+          // Extended colour: skip its parameters (5;n or 2;r;g;b) and draw in the default.
+          j += codes[j + 1] === 5 ? 2 : codes[j + 1] === 2 ? 4 : 0;
+          if (code === 38) style = { ...style, color: '' };
+        } else if (CHAT_STATUSLINE_COLORS[code]) style = { ...style, color: CHAT_STATUSLINE_COLORS[code] };
+        else if (code === 37 || code === 97) style = { ...style, color: '' };
+      }
+    }
+    lines.push(segments);
+  }
+  return lines;
+}
+
+/**
+ * Whether a prompt is folded, and what its folded form shows: the first lines, capped
+ * in characters so one enormous pasted line folds too.
+ */
+function chatViewPromptFold(text) {
+  const value = String(text ?? '');
+  const lines = value.split('\n');
+  if (lines.length <= CHAT_PROMPT_FOLD_LINES && value.length <= CHAT_PROMPT_FOLD_CHARS) {
+    return { folded: false, head: value, totalLines: lines.length };
+  }
+  let head = lines.slice(0, CHAT_PROMPT_HEAD_LINES).join('\n');
+  if (head.length > CHAT_PROMPT_HEAD_CHARS) head = `${head.slice(0, CHAT_PROMPT_HEAD_CHARS)}…`;
+  return { folded: true, head, totalLines: lines.length };
+}
+
+/**
+ * Whether a keydown in the message box sends. Enter sends and Shift+Enter (or Alt+Enter)
+ * adds a line; on a touch device a bare Enter adds a line and only the Send button (or
+ * Ctrl/Cmd+Enter from a hardware keyboard) sends, as in the phone's Compose dialog. A key
+ * that ends an IME composition never sends.
+ */
+function chatViewEnterSends(ev, touch) {
+  if (!ev || ev.key !== 'Enter') return false;
+  if (ev.isComposing || ev.keyCode === 229) return false;
+  if (ev.shiftKey || ev.altKey) return false;
+  if (ev.ctrlKey || ev.metaKey) return true;
+  return !touch;
+}
+
+/**
+ * The text that goes to the pane for a message box value: line breaks normalised to
+ * `\n`, trailing whitespace dropped, and one `\r` that submits. Null when there is
+ * nothing to send.
+ */
+function chatViewSendPayload(value) {
+  const text = String(value ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/\s+$/, '');
+  if (text.trim() === '') return null;
+  return `${text}\r`;
+}
+
+/** Most rows the `/` menu shows at once. */
+const CHAT_SLASH_MENU_MAX = 50;
+
+/**
+ * What the user is typing after `/`, while the caret is still in the message's first word and
+ * that word starts with `/`: '' right after the `/`, null otherwise.
+ */
+function chatViewSlashQuery(value, caret) {
+  const text = String(value ?? '');
+  if (!text.startsWith('/')) return null;
+  const end = text.search(/\s/);
+  const tokenEnd = end === -1 ? text.length : end;
+  if (typeof caret === 'number' && caret > tokenEnd) return null;
+  return text.slice(1, tokenEnd);
+}
+
+/**
+ * The commands that match `query`, best first: an exact name, then names that start with it,
+ * then names where a word starts with it (after `:`, `-` or `_`), then names that contain it,
+ * then descriptions where a word starts with it. Case is ignored, and input order breaks ties.
+ */
+function chatViewSlashMatches(commands, query, limit = CHAT_SLASH_MENU_MAX) {
+  const q = String(query ?? '').toLowerCase();
+  const ranked = [];
+  (Array.isArray(commands) ? commands : []).forEach((command, index) => {
+    const name = String(command?.name ?? '').toLowerCase();
+    if (!name) return;
+    let rank;
+    if (q === '') rank = 1;
+    else if (name === q) rank = 0;
+    else if (name.startsWith(q)) rank = 1;
+    else if (name.split(/[:_-]/).some((word) => word.startsWith(q))) rank = 2;
+    else if (name.includes(q)) rank = 3;
+    else if (
+      String(command.description ?? '')
+        .toLowerCase()
+        .split(/[^\p{L}\p{N}]+/u)
+        .some((word) => word.startsWith(q))
+    )
+      rank = 4;
+    else return;
+    ranked.push({ command, rank, index });
+  });
+  ranked.sort((a, b) => a.rank - b.rank || a.index - b.index);
+  return ranked.slice(0, limit).map((entry) => entry.command);
+}
+
 if (typeof window !== 'undefined') {
   window.WEBGL_FALLBACK = WEBGL_FALLBACK;
   window.evaluateWebGLLongTaskTrip = evaluateWebGLLongTaskTrip;
@@ -1580,6 +1862,22 @@ if (typeof window !== 'undefined') {
   window.CodemanTabSearch = {
     needle: tabSearchNeedle,
     filter: filterTabSearchRows,
+  };
+  window.CodemanChatView = {
+    visibleMessages: chatViewVisibleMessages,
+    messageKey: chatViewMessageKey,
+    renderPlan: chatViewRenderPlan,
+    promptFold: chatViewPromptFold,
+    promptText: chatViewPromptText,
+    promptCount: chatViewPromptCount,
+    pendingConfirmed: chatViewPendingConfirmed,
+    activity: chatViewActivity,
+    statusLineSegments: chatViewStatusLineSegments,
+    elapsed: chatViewElapsed,
+    enterSends: chatViewEnterSends,
+    sendPayload: chatViewSendPayload,
+    slashQuery: chatViewSlashQuery,
+    slashMatches: chatViewSlashMatches,
   };
   window.CodemanInputLimit = {
     FRAME_MAX_CHARS: INPUT_FRAME_MAX_CHARS,
@@ -1754,6 +2052,7 @@ const SSE_EVENTS = {
   SESSION_RUNNING: 'session:running',
   SESSION_STATUS_TELEMETRY: 'session:statusTelemetry',
   SESSION_PROMPT_CACHE: 'session:promptCache',
+  SESSION_STATUS_LINE: 'session:statusLine',
   SESSION_KEEP_WARM: 'session:keepWarm',
 
   // Scheduled runs
@@ -1914,6 +2213,7 @@ const SSE_EVENTS = {
   TRANSCRIPT_PLAN_MODE: 'transcript:plan_mode',
   TRANSCRIPT_TOOL_START: 'transcript:tool_start',
   TRANSCRIPT_TOOL_END: 'transcript:tool_end',
+  TRANSCRIPT_UPDATE: 'transcript:update',
 
   // Clipboard
   CLIPBOARD_WRITE: 'clipboard:write',

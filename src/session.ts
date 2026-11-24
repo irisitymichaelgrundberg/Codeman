@@ -663,6 +663,10 @@ export class Session extends EventEmitter {
   private _watching: string | null = null;
   /** Last `prompt_cache` report from the statusline exporter; null until Claude sends one. */
   private _promptCache: PromptCacheStatus | null = null;
+  /** The statusline's text, for the chat view (see SessionState.statusLine). Runtime only. */
+  private _statusLine = '';
+  /** The CLI's suggested next prompt, for the chat view (see SessionState.promptSuggestion). Runtime only. */
+  private _promptSuggestion = '';
   private _contextReport: ContextReport | null = null;
   /** Prompt-cache keep-warm opt-in; undefined = follow the app-wide default. Persisted. */
   private _keepWarmEnabled: boolean | undefined;
@@ -1794,6 +1798,30 @@ export class Session extends EventEmitter {
     return this._promptCache;
   }
 
+  /** What the CLI's statusline shows, already sanitized (statusline-text.ts); '' when unknown. */
+  get statusLine(): string {
+    return this._statusLine;
+  }
+
+  /** Replace the statusline text; true when it changed (the caller broadcasts only a change). */
+  setStatusLine(text: string): boolean {
+    if (text === this._statusLine) return false;
+    this._statusLine = text;
+    return true;
+  }
+
+  /** The suggested next prompt read off the pane (prompt-suggestion-reader.ts); '' when none. */
+  get promptSuggestion(): string {
+    return this._promptSuggestion;
+  }
+
+  /** Replace the suggested next prompt; true when it changed (the caller broadcasts only a change). */
+  setPromptSuggestion(text: string): boolean {
+    if (text === this._promptSuggestion) return false;
+    this._promptSuggestion = text;
+    return true;
+  }
+
   /** Whether the current launch carries the statusLine exporter (`MuxSession.statusLine`); undefined when unknown. */
   get statusLineExporter(): StatusLineExporter | undefined {
     return this._muxSession?.statusLine;
@@ -2491,6 +2519,8 @@ export class Session extends EventEmitter {
       advisorModel: this._advisorModel,
       customModel: this.customModel,
       displayModel: this.displayModel,
+      statusLine: this._statusLine || undefined,
+      promptSuggestion: this._promptSuggestion || undefined,
       // COD-118: runtime-only — surfaced so the frontend can require explicit user
       // intent before restarting a crash-looped session. Deliberately NOT restored
       // by the constructor: a Codeman restart starts with a fresh breaker so boot

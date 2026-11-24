@@ -745,6 +745,9 @@ const RateLimitWindowSchema = z
 
 export const StatusTelemetrySchema = z.object({
   sessionId: z.string().min(1).max(100),
+  // Base64 of the user's own statusline output (the exporter's wrap branch), for the chat view.
+  // 4 KiB of output encodes to under 5.5k characters.
+  rendered: z.string().max(8192).optional(),
   data: z
     .object({
       rate_limits: z

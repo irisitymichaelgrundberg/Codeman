@@ -1182,6 +1182,20 @@ export interface SessionState {
    * value is restored after a restart until the next report replaces it.
    */
   displayModel?: DisplayModel;
+  /**
+   * What the CLI's statusline shows under its composer, for the chat view: the user's own
+   * statusline output (SGR colour sequences kept, everything else stripped by
+   * statusline-text.ts) or Codeman's own footer. Absent until the first report. Not
+   * persisted: the next render reports it again. Untrusted display text: render as text.
+   */
+  statusLine?: string;
+  /**
+   * The next prompt the CLI suggests in its empty composer (Claude Code draws it faint), read
+   * off the pane after a turn ends, for the chat view's message box. Absent when there is none,
+   * and cleared when a turn starts. Not persisted. Model text: render as text, never send it
+   * without the user.
+   */
+  promptSuggestion?: string;
   /** Sanitized per-session attachment history. */
   attachmentHistory?: SessionAttachmentHistoryItem[];
   /**

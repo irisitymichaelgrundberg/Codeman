@@ -13,7 +13,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createRouteTestHarness, type RouteTestHarness } from './_route-test-utils.js';
 import { registerStatusTelemetryRoutes } from '../../src/web/routes/status-telemetry-routes.js';
-import { SessionPromptCache, SessionStatusTelemetry } from '../../src/web/sse-events.js';
+import { SessionPromptCache, SessionStatusLine, SessionStatusTelemetry } from '../../src/web/sse-events.js';
 import { Session } from '../../src/session.js';
 
 const SID = 'test-session-1'; // default id created by createMockRouteContext
@@ -36,14 +36,16 @@ describe('POST /api/status-telemetry', () => {
   });
 
   const post = (body: unknown) => h.app.inject({ method: 'POST', url: '/api/status-telemetry', payload: body });
+  // The plan-usage broadcasts only: the same post can also broadcast the statusline text.
+  const telemetryCalls = () => h.ctx.broadcast.mock.calls.filter(([name]) => name === SessionStatusTelemetry);
 
   it('broadcasts plan-usage telemetry and returns the session-status footer', async () => {
     const res = await post({ sessionId: SID, data: REAL });
     expect(res.statusCode).toBe(200);
     expect(res.headers['content-type']).toContain('text/plain');
     expect(res.body).toBe('Opus 4.8 (1M context)  in:562,411 out:1,188  ctx:56%');
-    expect(h.ctx.broadcast).toHaveBeenCalledTimes(1);
-    const [event, payload] = h.ctx.broadcast.mock.calls[0];
+    expect(telemetryCalls()).toHaveLength(1);
+    const [event, payload] = telemetryCalls()[0];
     expect(event).toBe(SessionStatusTelemetry);
     expect(payload).toMatchObject({
       sessionId: SID,
@@ -91,7 +93,7 @@ describe('POST /api/status-telemetry', () => {
   it('dedups identical telemetry — rebroadcasts only once', async () => {
     await post({ sessionId: SID, data: REAL });
     await post({ sessionId: SID, data: REAL });
-    expect(h.ctx.broadcast).toHaveBeenCalledTimes(1);
+    expect(telemetryCalls()).toHaveLength(1);
   });
 
   it('rebroadcasts when a displayed window percentage changes', async () => {
@@ -101,13 +103,42 @@ describe('POST /api/status-telemetry', () => {
       rate_limits: { ...REAL.rate_limits, five_hour: { used_percentage: 16, resets_at: 1781409000 } },
     };
     await post({ sessionId: SID, data: moved });
-    expect(h.ctx.broadcast).toHaveBeenCalledTimes(2);
+    expect(telemetryCalls()).toHaveLength(2);
   });
 
   it('does NOT rebroadcast on context-only drift (the chip never shows context %)', async () => {
     await post({ sessionId: SID, data: REAL });
     await post({ sessionId: SID, data: { ...REAL, context_window: { ...REAL.context_window, used_percentage: 91 } } });
-    expect(h.ctx.broadcast).toHaveBeenCalledTimes(1);
+    expect(telemetryCalls()).toHaveLength(1);
+  });
+
+  describe('statusline text for the chat view', () => {
+    const lineCalls = () => h.ctx.broadcast.mock.calls.filter(([name]) => name === SessionStatusLine);
+    const b64 = (text: string) => Buffer.from(text, 'utf8').toString('base64');
+
+    it("stores the user's own statusline output, colour kept, and broadcasts it once per change", async () => {
+      const shown = '\u001b[36m/work\u001b[0m \u001b[32m27%\u001b[0m';
+      const res = await post({ sessionId: SID, rendered: b64(`${shown}\u001b[2K`), data: REAL });
+      // The footer printed by the route is unchanged: the user's command printed its own.
+      expect(res.body).toBe('Opus 4.8 (1M context)  in:562,411 out:1,188  ctx:56%');
+      expect(h.ctx._session.statusLine).toBe(shown);
+      expect(lineCalls()).toEqual([[SessionStatusLine, { sessionId: SID, text: shown }]]);
+      await post({ sessionId: SID, rendered: b64(shown), data: REAL });
+      expect(lineCalls()).toHaveLength(1);
+    });
+
+    it("uses Codeman's own footer when there is no statusline of the user's", async () => {
+      await post({ sessionId: SID, data: REAL });
+      expect(h.ctx._session.statusLine).toBe('Opus 4.8 (1M context)  in:562,411 out:1,188  ctx:56%');
+      expect(lineCalls()).toHaveLength(1);
+    });
+
+    it('records nothing for a CLI without a statusline exporter', async () => {
+      h.ctx._session.mode = 'shell';
+      await post({ sessionId: SID, rendered: b64('x'), data: REAL });
+      expect(h.ctx._session.statusLine).toBe('');
+      expect(lineCalls()).toHaveLength(0);
+    });
   });
 
   it("tolerates null in Claude's undocumented fields (no 400) and ignores them", async () => {

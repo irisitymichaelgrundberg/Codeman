@@ -15,6 +15,7 @@ import { installRouteErrorHandler } from '../../src/web/route-error-handler.js';
 import { registerSessionRoutes } from '../../src/web/routes/session-routes.js';
 import { ApiErrorCode, httpStatusForErrorCode } from '../../src/types.js';
 import { createMockRouteContext, type MockRouteContext } from '../mocks/index.js';
+import { KEEP_WARM_NUDGE } from '../../src/prompt-cache-keepwarm.js';
 
 interface LocalHarness {
   app: FastifyInstance;
@@ -236,6 +237,94 @@ describe('GET /api/sessions/:id/last-response (claude)', () => {
       ['assistant', 'First answer.'],
       ['user', 'continue'],
       ['assistant', 'Second answer.'],
+    ]);
+  });
+
+  it('starts a transcript watcher for the chat view when the session has none, and only then', async () => {
+    const sessionId = harness.ctx._session.id;
+    const session = harness.ctx._session as typeof harness.ctx._session & {
+      claudeSessionId: string;
+      adoptClaudeSessionId: ReturnType<typeof vi.fn>;
+    };
+    session.claudeSessionId = sessionId;
+    session.adoptClaudeSessionId = vi.fn();
+    writeTranscript(sessionId, [userEntry('Hi'), assistantEntry('Hello.', '2026-07-21T00:00:01Z')]);
+    const start = harness.ctx.startTranscriptWatcher as ReturnType<typeof vi.fn>;
+    const current = harness.ctx.getTranscriptPath as ReturnType<typeof vi.fn>;
+
+    // The brief view and agent pollers read without starting anything.
+    await getLastResponse(sessionId, false);
+    expect(start).not.toHaveBeenCalled();
+
+    await getLastResponse(sessionId, true);
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(start.mock.calls[0][0]).toBe(sessionId);
+    expect(String(start.mock.calls[0][1])).toMatch(new RegExp(`${sessionId}\\.jsonl$`));
+
+    // A watcher already running (a hook reported its path) is left alone.
+    current.mockReturnValue('/some/path.jsonl');
+    await getLastResponse(sessionId, true);
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks Codeman's keep-warm turns so the chat view can leave them out", async () => {
+    const sessionId = harness.ctx._session.id;
+    const session = harness.ctx._session as typeof harness.ctx._session & {
+      claudeSessionId: string;
+      adoptClaudeSessionId: ReturnType<typeof vi.fn>;
+    };
+    session.claudeSessionId = sessionId;
+    session.adoptClaudeSessionId = vi.fn();
+    writeTranscript(sessionId, [
+      userEntry('Fix the bug'),
+      assistantEntry('Fixed.', '2026-07-21T00:00:01Z'),
+      userEntry(KEEP_WARM_NUDGE),
+      assistantEntry('ok', '2026-07-21T00:00:02Z'),
+      userEntry('Thanks'),
+      assistantEntry('You are welcome.', '2026-07-21T00:00:03Z'),
+    ]);
+
+    const { body } = await getLastResponse(sessionId, true);
+    expect(
+      body.data.messages.map((message: { role: string; text: string; keepAlive?: boolean }) => [
+        message.role,
+        message.text,
+        message.keepAlive === true,
+      ])
+    ).toEqual([
+      ['user', 'Fix the bug', false],
+      ['assistant', 'Fixed.', false],
+      ['user', KEEP_WARM_NUDGE, true],
+      ['assistant', 'ok', true],
+      ['user', 'Thanks', false],
+      ['assistant', 'You are welcome.', false],
+    ]);
+  });
+
+  it('keeps a prompt the user queued during a keep-warm turn, and the answer to it', async () => {
+    const sessionId = harness.ctx._session.id;
+    const session = harness.ctx._session as typeof harness.ctx._session & {
+      claudeSessionId: string;
+      adoptClaudeSessionId: ReturnType<typeof vi.fn>;
+    };
+    session.claudeSessionId = sessionId;
+    session.adoptClaudeSessionId = vi.fn();
+    writeTranscript(sessionId, [
+      userEntry(KEEP_WARM_NUDGE),
+      queuedEntry('Also run the tests', '2026-07-21T00:00:01Z'),
+      assistantEntry('ok. Tests pass.', '2026-07-21T00:00:02Z'),
+    ]);
+
+    const { body } = await getLastResponse(sessionId, true);
+    expect(
+      body.data.messages.map((message: { text: string; keepAlive?: boolean }) => [
+        message.text,
+        message.keepAlive === true,
+      ])
+    ).toEqual([
+      [KEEP_WARM_NUDGE, true],
+      ['Also run the tests', false],
+      ['ok. Tests pass.', false],
     ]);
   });
 
@@ -727,7 +816,7 @@ describe('GET /api/sessions/:id/last-response (relocated Claude config folder, #
     expect(pane.adoptClaudeSessionId).toHaveBeenCalledWith('after-clear');
   });
 
-  it("keeps a Docker session off its override, which names a folder inside the container", async () => {
+  it('keeps a Docker session off its override, which names a folder inside the container', async () => {
     const home = join(testHome, '.claude');
     writeTranscript(home, 'conversation-a', 'what the host folder holds');
     writeTranscript(relocated, 'conversation-a', 'a host folder that only shares the path');

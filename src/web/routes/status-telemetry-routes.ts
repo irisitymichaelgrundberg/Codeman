@@ -27,7 +27,8 @@ import {
   telemetrySignature,
   type RawStatuslinePayload,
 } from '../../usage-telemetry.js';
-import { SessionPromptCache, SessionStatusTelemetry } from '../sse-events.js';
+import { SessionPromptCache, SessionStatusLine, SessionStatusTelemetry } from '../sse-events.js';
+import { decodeRenderedStatusLine } from '../../statusline-text.js';
 import { setLatestPlanUsage } from '../plan-usage-latest.js';
 import type { SessionPort, EventPort, KeepWarmPort } from '../ports/index.js';
 import { getCli } from '../../config/cli-registry/index.js';
@@ -38,7 +39,7 @@ export function registerStatusTelemetryRoutes(app: FastifyInstance, ctx: Session
   const lastSig = new Map<string, string>();
 
   app.post('/api/status-telemetry', async (req, reply) => {
-    const { sessionId, data } = parseBody(StatusTelemetrySchema, req.body);
+    const { sessionId, data, rendered } = parseBody(StatusTelemetrySchema, req.body);
 
     reply.type('text/plain; charset=utf-8');
 
@@ -113,6 +114,15 @@ export function registerStatusTelemetryRoutes(app: FastifyInstance, ctx: Session
     // In-terminal statusline footer → CURRENT SESSION status (model / tokens /
     // context %), NOT the plan limits. Available from the first render, even
     // before rate_limits appears.
-    return formatSessionStatusText(parseSessionStatus(payload));
+    const footer = formatSessionStatusText(parseSessionStatus(payload));
+
+    // What the statusline shows, for the chat view: the user's own output when the exporter
+    // wraps a statusline of theirs (it sends a copy as `rendered`), else this footer, which IS
+    // the statusline then. Broadcast only a change: the statusline renders on every message.
+    if (session && reportsStatusLine) {
+      const text = rendered !== undefined ? decodeRenderedStatusLine(rendered) : footer;
+      if (session.setStatusLine(text)) ctx.broadcast(SessionStatusLine, { sessionId, text: session.statusLine });
+    }
+    return footer;
   });
 }

@@ -1553,6 +1553,29 @@ describe('statusline exporter script (real shell execution)', () => {
     expect(result.durationMs).toBeLessThan(1000);
   }, 10000);
 
+  it("wrap branch: prints the user's output unchanged, keeps its exit status, and posts a base64 copy", async () => {
+    const posted = join(binDir, 'posted.json');
+    writeFakeCurl(`cat > '${posted}'`);
+    const userCmd = "printf '\\033[36m/work\\033[0m ctx: 5%%'; exit 3";
+    const result = await runExporter({ ...baseEnv, CODEMAN_USER_STATUSLINE_CMD: userCmd });
+    expect(result.stdout).toBe('\u001b[36m/work\u001b[0m ctx: 5%');
+    expect(result.code).toBe(3);
+    // The copy is posted from a background subshell: wait for it to land.
+    let body = '';
+    for (let i = 0; i < 50 && !body.endsWith('}'); i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      try {
+        body = readFileSync(posted, 'utf-8');
+      } catch {
+        body = '';
+      }
+    }
+    const parsed = JSON.parse(body) as { sessionId: string; rendered: string; data: unknown };
+    expect(parsed.sessionId).toBe('x');
+    expect(parsed.data).toEqual({});
+    expect(Buffer.from(parsed.rendered, 'base64').toString('utf8')).toBe('\u001b[36m/work\u001b[0m ctx: 5%');
+  }, 10000);
+
   it('curl is bounded with --max-time so a HUNG (not just refused) Codeman cannot wedge the render', async () => {
     const scriptPath = await resolveStatusLineCliCommand(testDir, true);
     expect(readFileSync(scriptPath!, 'utf-8')).toContain('--max-time');

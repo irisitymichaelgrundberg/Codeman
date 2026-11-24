@@ -83,6 +83,7 @@ import { attachmentRegistry, buildFileThumbnailRoute, registerExternalAttachment
 import { folderAllowedForUser, folderGrants } from '../folder-listing.js';
 import { isOutsideWorktreeRootRefused, loadAttachmentGuardConfig } from '../config/attachment-guard.js';
 import { getCli, enabledClis, listClis } from '../config/cli-registry/registry.js';
+import { summarizeToolCall, toolCallCommand } from '../tool-call-summary.js';
 import { isCliEntryInstalled, probeStockCliAvailability } from '../utils/cli-installed-probes.js';
 import { readCustomModelHosts, resolveCustomModelContextLength } from '../custom-model-hosts.js';
 import {
@@ -109,6 +110,7 @@ import { getLifecycleLog } from '../session-lifecycle-log.js';
 import { clampEnvOverridesForOwner } from '../session-env-clamp.js';
 import {
   applyWorkspaceHooks,
+  ensureStatusLineExporterScript,
   pruneAgentSessionPreambles,
   readGitFetchSettings,
   readKeepWarmSettingsOrThrow,
@@ -133,6 +135,7 @@ import { agentInboxPersistence } from './agent-inbox-persistence.js';
 import { AI_CHECK_MODEL } from '../config/ai-defaults.js';
 import { approvalInbox } from './approval-inbox.js';
 import { SCREEN_BLOCKED_SOURCE } from './screen-blocked.js';
+import { PromptSuggestionReader } from './prompt-suggestion-reader.js';
 import { PromptCacheKeepWarmService } from '../prompt-cache-keepwarm.js';
 import { fetchWorkspaceOnce } from '../git-fetch.js';
 import { GitFetchScheduler } from '../git-fetch-scheduler.js';
@@ -280,6 +283,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // while capping growth of `sseClientsById` and blocking pathological inputs.
 const SSE_CLIENT_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 const CODEX_USAGE_POLL_INTERVAL_MS = 5 * 60_000;
+/** Longest a session's `transcript:update` broadcast waits behind the one before it. */
+const TRANSCRIPT_UPDATE_THROTTLE_MS = 750;
 // Copilot's quota is read over the network from GitHub, and a monthly figure moves slowly.
 const COPILOT_USAGE_POLL_INTERVAL_MS = 10 * 60_000;
 
@@ -430,6 +435,13 @@ export class WebServer extends EventEmitter {
   private respawnTimers: Map<string, { timer: NodeJS.Timeout; endAt: number; startedAt: number }> = new Map();
   private runSummaryTrackers: Map<string, RunSummaryTracker> = new Map();
   private transcriptWatchers: Map<string, TranscriptWatcher> = new Map();
+  /**
+   * Per-session throttle for the `transcript:update` broadcast: the first update in a quiet
+   * period goes out at once, and a burst after it collapses into one trailing event per
+   * TRANSCRIPT_UPDATE_THROTTLE_MS. A busy turn writes several lines a second, and every SSE
+   * client gets every broadcast.
+   */
+  private transcriptUpdateThrottle: Map<string, { lastAt: number; timer: NodeJS.Timeout | null }> = new Map();
   // Store session listener references for explicit cleanup (prevents memory leaks)
   private sessionListenerRefs: Map<string, SessionListenerRefs> = new Map();
   private scheduledRuns: Map<string, ScheduledRun> = new Map();
@@ -441,6 +453,25 @@ export class WebServer extends EventEmitter {
   // service; the server only lends it the facts a decision needs. A field initializer, not a
   // setupRoutes() step: cleanup and listener wiring reach it on servers that never set up routes
   // (the pane-exit and discard tests build a bare WebServer), and every port reads `this.*` lazily.
+  // Claude Code's suggested next prompt, read off the pane after a turn ends, for the chat view
+  // (prompt-suggestion-reader.ts). Only sessions the chat view can show are read: a Claude-format
+  // transcript, a local pane, not adopted.
+  private readonly promptSuggestionReader = new PromptSuggestionReader({
+    read: (id) => {
+      const session = this.sessions.get(id);
+      const cli = session ? getCli(session.mode) : undefined;
+      const glyph = cli?.capabilities.workDetect?.promptGlyph;
+      if (!session || cli?.capabilities.transcript !== 'claude-jsonl' || !glyph) return null;
+      if (session.remote || session.isAdopted || !session.muxName) return null;
+      const screen = this.mux.capturePaneText?.(session.muxName, undefined, { styles: true }) ?? null;
+      return screen ? { screen, glyph } : null;
+    },
+    isIdle: (id) => this.sessions.get(id)?.status === 'idle',
+    publish: (id, text) => {
+      if (this.sessions.get(id)?.setPromptSuggestion(text)) this.broadcastSessionStateDebounced(id);
+    },
+  });
+
   private readonly keepWarmService = new PromptCacheKeepWarmService({
     getSession: (id) => this.sessions.get(id),
     sessionIds: () => this.sessions.keys(),
@@ -1499,8 +1530,23 @@ export class WebServer extends EventEmitter {
         this.broadcast(SseEvent.TranscriptPlanMode, { sessionId, timestamp: Date.now() });
       });
 
-      watcher.on('transcript:tool_start', (toolName: string) => {
-        this.broadcast(SseEvent.TranscriptToolStart, { sessionId, toolName, timestamp: Date.now() });
+      watcher.on('transcript:tool_start', (toolName: string, input?: unknown) => {
+        // `detail` names what the call works on (the file, the command), for the chat view's
+        // status line; absent when the input names nothing worth showing.
+        const detail = summarizeToolCall(toolName, input);
+        // A Bash call with a description also sends its command, shown under it as the CLI does.
+        const command = toolCallCommand(toolName, input);
+        this.broadcast(SseEvent.TranscriptToolStart, {
+          sessionId,
+          toolName,
+          ...(detail ? { detail } : {}),
+          ...(command ? { command } : {}),
+          timestamp: Date.now(),
+        });
+      });
+
+      watcher.on('transcript:update', () => {
+        this.broadcastTranscriptUpdate(sessionId);
       });
 
       watcher.on('transcript:tool_end', (toolName: string, isError: boolean) => {
@@ -1548,10 +1594,39 @@ export class WebServer extends EventEmitter {
     }
   }
 
+  /** Broadcast `transcript:update` for a session, throttled (see `transcriptUpdateThrottle`). */
+  private broadcastTranscriptUpdate(sessionId: string): void {
+    const state = this.transcriptUpdateThrottle.get(sessionId) ?? { lastAt: 0, timer: null };
+    this.transcriptUpdateThrottle.set(sessionId, state);
+    if (state.timer) return; // a trailing broadcast is already scheduled and will cover this one
+    const send = (): void => {
+      state.lastAt = Date.now();
+      this.broadcast(SseEvent.TranscriptUpdate, { sessionId, timestamp: state.lastAt });
+    };
+    const wait = state.lastAt + TRANSCRIPT_UPDATE_THROTTLE_MS - Date.now();
+    if (wait <= 0) {
+      send();
+      return;
+    }
+    state.timer = setTimeout(() => {
+      state.timer = null;
+      send();
+    }, wait);
+    state.timer.unref?.();
+  }
+
+  /** Drop a session's pending `transcript:update` broadcast. */
+  private clearTranscriptUpdateThrottle(sessionId: string): void {
+    const state = this.transcriptUpdateThrottle.get(sessionId);
+    if (state?.timer) clearTimeout(state.timer);
+    this.transcriptUpdateThrottle.delete(sessionId);
+  }
+
   /**
    * Stop the transcript watcher for a session.
    */
   private stopTranscriptWatcher(sessionId: string): void {
+    this.clearTranscriptUpdateThrottle(sessionId);
     const watcher = this.transcriptWatchers.get(sessionId);
     if (watcher) {
       watcher.removeAllListeners(); // Prevent memory leaks from attached listeners
@@ -1737,6 +1812,7 @@ export class WebServer extends EventEmitter {
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     this.keepWarmService.remove(sessionId);
+    this.promptSuggestionReader.forget(sessionId);
     // A closed session takes its place in the fetch schedule with it: otherwise a detached-and-forgotten id
     // would still count as tracked, and its next run would land on a session that no longer exists.
     this.gitFetchScheduler.remove(sessionId);
@@ -2163,6 +2239,17 @@ export class WebServer extends EventEmitter {
     // Which run modes keep their PTY rows under a phone keyboard (inline renderers,
     // the `keyboardHold` capability; `_keyboardHoldEligible` in terminal-ui.js). Same
     // shape and reasoning as the page-key list above.
+    // Which run modes the chat view can show (chat-view.js): the CLIs whose conversation Codeman
+    // reads from a Claude-format transcript, read off the `transcript` capability, never an id
+    // list here. Disabled entries are kept (`listClis`), like the wheel map below: disabling a CLI
+    // never ends its running sessions. Ids only, so JSON.stringify alone is enough.
+    const chatViewClis = listClis()
+      .filter((entry) => entry.capabilities.transcript === 'claude-jsonl')
+      .map((entry) => entry.id);
+    html = html.replace(
+      '</head>',
+      () => `<script>window.__codemanChatViewModes=${JSON.stringify(chatViewClis)};</script>\n</head>`
+    );
     const keyboardHoldClis = enabledClis()
       .filter((entry) => entry.capabilities.keyboardHold === 'inline')
       .map((entry) => entry.id);
@@ -2304,6 +2391,8 @@ export class WebServer extends EventEmitter {
     return {
       broadcast: this.broadcast.bind(this),
       keepWarmSchedule: (id: string) => void this.keepWarmService.schedule(id),
+      promptSuggestionIdle: (id: string) => this.promptSuggestionReader.onIdle(id),
+      promptSuggestionWorking: (id: string) => this.promptSuggestionReader.onWorking(id),
       batchTerminalData: this.batchTerminalData.bind(this),
       batchTaskUpdate: this.batchTaskUpdate.bind(this),
       broadcastSessionStateDebounced: this.broadcastSessionStateDebounced.bind(this),
@@ -3507,6 +3596,19 @@ export class WebServer extends EventEmitter {
     // settings (2 s cache) and before listen, so no session create can see the old value.
     if (!this.testMode && (await migrateAgentSkillDefault()) === 'switched-on') {
       this._settingsCache = null;
+    }
+
+    // Running sessions execute the statusline exporter script on every render, and it is only
+    // rewritten when a session launches. Bring an existing copy up to this build's version now,
+    // so sessions that outlived the restart send what this build expects (the chat view's
+    // statusline copy). A missing script stays missing: the next launch that needs it writes it.
+    if (!this.testMode) {
+      try {
+        await fs.access(dataPath('statusline-exporter.sh'));
+        await ensureStatusLineExporterScript();
+      } catch {
+        // Absent or unwritable: nothing to refresh.
+      }
     }
 
     // Restore mux sessions BEFORE accepting connections
@@ -4738,6 +4840,7 @@ export class WebServer extends EventEmitter {
     sessionWaits.cancelEverything();
     approvalInbox.stop();
     this.keepWarmService.stop();
+    this.promptSuggestionReader.stop();
     // Stops the fetch sweep from starting another run while the server is closing; a git process already
     // running is left to finish, which is what a fetch does to a repository nothing else is touching.
     this.gitFetchScheduler.stop();
@@ -4856,6 +4959,7 @@ export class WebServer extends EventEmitter {
     this.respawnTimers.clear();
     this.runSummaryTrackers.clear();
     this.transcriptWatchers.clear();
+    for (const sessionId of [...this.transcriptUpdateThrottle.keys()]) this.clearTranscriptUpdateThrottle(sessionId);
     await this.editHistorySync.flushAll().catch((err) => {
       console.warn('[EditHistory] Saving on shutdown failed:', getErrorMessage(err));
     });

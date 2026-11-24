@@ -137,7 +137,8 @@ describe('TranscriptWatcher', () => {
       appendFileSync(testFile, JSON.stringify(assistantEntry) + '\n');
 
       await vi.waitFor(() => {
-        expect(toolStartHandler).toHaveBeenCalledWith('Read');
+        // The input rides along so the server can say what the call works on (tool-call-summary.ts).
+        expect(toolStartHandler).toHaveBeenCalledWith('Read', { file_path: '/test.txt' });
       });
       const state = watcher.getState();
       expect(state.toolExecuting).toBe(true);

@@ -99,6 +99,10 @@ interface SessionListenerDeps {
    * recovered pane is attached, so the restored report can arm its timer.
    */
   keepWarmSchedule?(sessionId: string): void;
+  /** Look for the CLI's suggested next prompt now that a turn ended (prompt-suggestion-reader.ts). */
+  promptSuggestionIdle?(sessionId: string): void;
+  /** A turn started, so the CLI dropped its suggested next prompt. */
+  promptSuggestionWorking?(sessionId: string): void;
 }
 
 /**
@@ -251,6 +255,7 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
       // open. `stop` was the first thing to clear it, which on a long turn is
       // minutes away.
       approvalInbox.resolveIfDialogGone(session.id);
+      deps.promptSuggestionWorking?.(session.id);
       // `keepAlive` tells the page this turn is Codeman's own keep-alive (stuck detection ignores it).
       deps.broadcast(SseEvent.SessionWorking, {
         id: session.id,
@@ -274,6 +279,7 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
       deps.broadcast(SseEvent.SessionIdle, { id: session.id, ...(session.keepAliveTurnActive && { keepAlive: true }) });
       deps.broadcastSessionStateDebounced(session.id);
       deps.keepWarmSchedule?.(session.id);
+      deps.promptSuggestionIdle?.(session.id);
       const tracker = deps.getRunSummaryTracker(session.id);
       if (tracker) {
         tracker.recordIdle();
