@@ -8,7 +8,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCookie from '@fastify/cookie';
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { installRouteErrorHandler } from '../../src/web/route-error-handler.js';
@@ -112,6 +113,54 @@ describe('GET /api/sessions/:id/last-response (claude)', () => {
     return { response, body: JSON.parse(response.body) };
   }
 
+  it('draws a typed slash command as typed, leaves out the skill body and /clear', async () => {
+    const id = harness.ctx._session.id;
+    (harness.ctx._session as typeof harness.ctx._session & { claudeSessionId: string }).claudeSessionId = id;
+    harness.ctx._session.mode = 'claude';
+    writeTranscript(id, [
+      // Claude Code 2.1.331's rows for a typed skill: the command, then the skill body as a meta row.
+      userEntry('<command-message>dual-review</command-message>\n<command-name>/dual-review</command-name>'),
+      userEntry('Base directory for this skill: /x/.claude/skills/dual-review\n\n# Dual review', { isMeta: true }),
+      assistantEntry('Both reviews are done.', '2026-07-21T00:00:01Z'),
+      // A built-in with arguments, and a /clear.
+      userEntry(
+        '<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>opus</command-args>'
+      ),
+      userEntry(
+        '<command-name>/clear</command-name>\n<command-message>clear</command-message>\n<command-args></command-args>'
+      ),
+    ]);
+    const full = await getLastResponse(id, true);
+    expect(full.body.data.messages.map((m: { role: string; text: string }) => [m.role, m.text])).toEqual([
+      ['user', '/dual-review'],
+      ['assistant', 'Both reviews are done.'],
+      ['user', '/model opus'],
+    ]);
+  });
+
+  it('draws a replayed typed command once, and a repeat after a reply twice', async () => {
+    const id = harness.ctx._session.id;
+    (harness.ctx._session as typeof harness.ctx._session & { claudeSessionId: string }).claudeSessionId = id;
+    harness.ctx._session.mode = 'claude';
+    const typedRows = (full: { body: { data: { messages: { role: string; text: string }[] } } }) =>
+      full.body.data.messages.filter((m) => m.role === 'user' && m.text === '/compact').length;
+
+    // A restore replays the command row before any assistant text: it is drawn once.
+    writeTranscript(id, [
+      userEntry('<command-name>/compact</command-name>'),
+      userEntry('<command-name>/compact</command-name>'),
+    ]);
+    expect(typedRows(await getLastResponse(id, true))).toBe(1);
+
+    // The same command typed again after a reply is a second turn: it is drawn twice.
+    writeTranscript(id, [
+      userEntry('<command-name>/compact</command-name>'),
+      assistantEntry('Compacted.', '2026-07-21T00:00:01Z'),
+      userEntry('<command-name>/compact</command-name>'),
+    ]);
+    expect(typedRows(await getLastResponse(id, true))).toBe(2);
+  });
+
   it('recovers a placeholder tmux session by UUID prefix and renders one message per model message', async () => {
     const restoredId = 'restored-40568a29';
     const conversationId = '40568a29-d4eb-4eb6-b671-8401428e4f39';
@@ -156,7 +205,9 @@ describe('GET /api/sessions/:id/last-response (claude)', () => {
       timestamp: '2026-07-21T00:00:06Z',
       // #169's guarantees all still hold and this array proves them: the replayed
       // 'first prompt' row, the replayed 'Checking the files.' snapshot, the
-      // sidechain row and all five synthetic rows are absent. Only the GROUPING
+      // sidechain row and the four synthetic rows are absent. The typed `/status`
+      // command shows as the user typed it, in the same turn as the prompt after it.
+      // Only the GROUPING
       // UNIT narrows, from one card per human turn to one card per model
       // message, carried by `turn` instead of by a '\n\n' joiner.
       messages: [
@@ -183,6 +234,14 @@ describe('GET /api/sessions/:id/last-response (claude)', () => {
           text: 'The first result is ready.',
           timestamp: '2026-07-21T00:00:03Z',
           turn: 1,
+        },
+        {
+          kind: 'prompt',
+          label: 'Prompt',
+          role: 'user',
+          text: '/status',
+          timestamp: '2026-07-21T00:00:00Z',
+          turn: 2,
         },
         {
           kind: 'prompt',
@@ -267,6 +326,140 @@ describe('GET /api/sessions/:id/last-response (claude)', () => {
     expect(start).toHaveBeenCalledTimes(1);
   });
 
+  it('moves a watcher it started itself to the new file after /clear', async () => {
+    const sessionId = harness.ctx._session.id;
+    const session = harness.ctx._session as typeof harness.ctx._session & {
+      claudeSessionId: string;
+      adoptClaudeSessionId: ReturnType<typeof vi.fn>;
+    };
+    session.claudeSessionId = sessionId;
+    session.adoptClaudeSessionId = vi.fn();
+    writeTranscript(sessionId, [userEntry('Hi'), assistantEntry('Hello.', '2026-07-21T00:00:01Z')]);
+    const start = harness.ctx.startTranscriptWatcher as ReturnType<typeof vi.fn>;
+    const current = harness.ctx.getTranscriptPath as ReturnType<typeof vi.fn>;
+
+    await getLastResponse(sessionId, true);
+    expect(start).toHaveBeenCalledTimes(1);
+    const fileA = String(start.mock.calls[0][1]);
+    current.mockReturnValue(fileA);
+
+    // The same file again: nothing to move.
+    await getLastResponse(sessionId, true);
+    expect(start).toHaveBeenCalledTimes(1);
+
+    // A /clear starts a new conversation file, and no hook moves the watcher onto it.
+    const clearedId = 'b0c1d2e3-0000-4000-8000-000000000001';
+    session.claudeSessionId = clearedId;
+    writeTranscript(clearedId, [userEntry('After clear'), assistantEntry('Fresh.', '2026-07-21T00:00:02Z')]);
+    await getLastResponse(sessionId, true);
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(start.mock.calls[1][0]).toBe(sessionId);
+    expect(String(start.mock.calls[1][1])).toMatch(new RegExp(`${clearedId}\\.jsonl$`));
+  });
+
+  it('never moves a watcher whose path a hook set', async () => {
+    const sessionId = harness.ctx._session.id;
+    const session = harness.ctx._session as typeof harness.ctx._session & {
+      claudeSessionId: string;
+      adoptClaudeSessionId: ReturnType<typeof vi.fn>;
+    };
+    session.claudeSessionId = sessionId;
+    session.adoptClaudeSessionId = vi.fn();
+    writeTranscript(sessionId, [userEntry('Hi'), assistantEntry('Hello.', '2026-07-21T00:00:01Z')]);
+    const start = harness.ctx.startTranscriptWatcher as ReturnType<typeof vi.fn>;
+    const current = harness.ctx.getTranscriptPath as ReturnType<typeof vi.fn>;
+
+    // A hook started the watcher on a path this read never recorded.
+    current.mockReturnValue('/hook/reported.jsonl');
+    await getLastResponse(sessionId, true);
+    const clearedId = 'b0c1d2e3-0000-4000-8000-000000000002';
+    session.claudeSessionId = clearedId;
+    writeTranscript(clearedId, [userEntry('After clear'), assistantEntry('Fresh.', '2026-07-21T00:00:02Z')]);
+    await getLastResponse(sessionId, true);
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it('leaves a watcher it started alone once a hook moved it', async () => {
+    const sessionId = harness.ctx._session.id;
+    const session = harness.ctx._session as typeof harness.ctx._session & {
+      claudeSessionId: string;
+      adoptClaudeSessionId: ReturnType<typeof vi.fn>;
+    };
+    session.claudeSessionId = sessionId;
+    session.adoptClaudeSessionId = vi.fn();
+    writeTranscript(sessionId, [userEntry('Hi'), assistantEntry('Hello.', '2026-07-21T00:00:01Z')]);
+    const start = harness.ctx.startTranscriptWatcher as ReturnType<typeof vi.fn>;
+    const current = harness.ctx.getTranscriptPath as ReturnType<typeof vi.fn>;
+
+    // The read starts the watcher on transcript A.
+    current.mockReturnValue(null);
+    await getLastResponse(sessionId, true);
+    expect(start).toHaveBeenCalledTimes(1);
+
+    // A hook then moves it to B, and a /clear leaves the conversation in C.
+    current.mockReturnValue('/hook/moved.jsonl');
+    const clearedId = 'b0c1d2e3-0000-4000-8000-000000000003';
+    session.claudeSessionId = clearedId;
+    writeTranscript(clearedId, [userEntry('After clear'), assistantEntry('Fresh.', '2026-07-21T00:00:02Z')]);
+    await getLastResponse(sessionId, true);
+    expect(start).toHaveBeenCalledTimes(1);
+
+    // The read forgot its record, so a later read leaves the hook's watcher alone too.
+    await getLastResponse(sessionId, true);
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+
+  it('starts no transcript watcher for a session removed while the read was in flight', async () => {
+    const sessionId = harness.ctx._session.id;
+    const session = harness.ctx._session as typeof harness.ctx._session & {
+      claudeSessionId: string;
+      adoptClaudeSessionId: ReturnType<typeof vi.fn>;
+    };
+    session.claudeSessionId = sessionId;
+    session.adoptClaudeSessionId = vi.fn();
+    writeTranscript(sessionId, [userEntry('Hi'), assistantEntry('Hello.', '2026-07-21T00:00:01Z')]);
+    const start = harness.ctx.startTranscriptWatcher as ReturnType<typeof vi.fn>;
+
+    // A delete or detach between the route's lookup and the transcript scan leaves the
+    // session out of the server's map; nothing would ever stop a watcher started for it.
+    harness.ctx.sessions.delete(sessionId);
+    const result = await harness.ctx.lastResponseFor!(session as never, 'full');
+    expect(start).not.toHaveBeenCalled();
+    expect((result as { messages?: unknown[] }).messages?.length).toBeGreaterThan(0);
+  });
+
+  it('remembers where a transcript was found, and scans again once the file moved', async () => {
+    const sessionId = harness.ctx._session.id;
+    const session = harness.ctx._session as typeof harness.ctx._session & {
+      claudeSessionId: string;
+      adoptClaudeSessionId: ReturnType<typeof vi.fn>;
+    };
+    session.claudeSessionId = sessionId;
+    session.adoptClaudeSessionId = vi.fn();
+    writeTranscript(sessionId, [userEntry('Hi'), assistantEntry('Hello.', '2026-07-21T00:00:01Z')]);
+    const projectsDir = join(testHome, '.claude', 'projects');
+    const readdir = vi.spyOn(fsPromises, 'readdir');
+    const projectScans = () => readdir.mock.calls.filter((call) => String(call[0]) === projectsDir).length;
+    try {
+      await getLastResponse(sessionId, true);
+      expect(projectScans()).toBe(1);
+
+      const second = await getLastResponse(sessionId, true);
+      expect(projectScans()).toBe(1);
+      expect(second.body.data.text).toBe('Hello.');
+
+      // The file moves to another project folder: the remembered path fails, the scan finds it.
+      const movedDir = join(projectsDir, '-elsewhere');
+      mkdirSync(movedDir, { recursive: true });
+      renameSync(join(projectsDir, '-workspace', `${sessionId}.jsonl`), join(movedDir, `${sessionId}.jsonl`));
+      const third = await getLastResponse(sessionId, true);
+      expect(projectScans()).toBe(2);
+      expect(third.body.data.text).toBe('Hello.');
+    } finally {
+      readdir.mockRestore();
+    }
+  });
+
   it("marks Codeman's keep-warm turns so the chat view can leave them out", async () => {
     const sessionId = harness.ctx._session.id;
     const session = harness.ctx._session as typeof harness.ctx._session & {
@@ -326,6 +519,30 @@ describe('GET /api/sessions/:id/last-response (claude)', () => {
       ['Also run the tests', false],
       ['ok. Tests pass.', false],
     ]);
+  });
+
+  it('opens a keep-warm turn of its own after a turn that ended without assistant text', async () => {
+    const sessionId = harness.ctx._session.id;
+    const session = harness.ctx._session as typeof harness.ctx._session & {
+      claudeSessionId: string;
+      adoptClaudeSessionId: ReturnType<typeof vi.fn>;
+    };
+    session.claudeSessionId = sessionId;
+    session.adoptClaudeSessionId = vi.fn();
+    writeTranscript(sessionId, [
+      userEntry('Fix the bug'),
+      { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tool-1' }] } },
+      userEntry(KEEP_WARM_NUDGE),
+      assistantEntry('ok', '2026-07-21T00:00:02Z'),
+    ]);
+
+    const { body } = await getLastResponse(sessionId, true);
+    const messages = body.data.messages as Array<{ role: string; text: string; turn: number; keepAlive?: boolean }>;
+    const prompt = messages.find((message) => message.text === 'Fix the bug');
+    const reply = messages.find((message) => message.text === 'ok');
+    expect(prompt?.keepAlive).toBeUndefined();
+    expect(reply?.keepAlive).toBe(true);
+    expect(reply?.turn).not.toBe(prompt?.turn);
   });
 
   /**

@@ -14,6 +14,7 @@ Press `Ctrl+?` in the app for the same list in a floating overlay.
 | `Alt+1` to `Alt+9`              | Switch to tab N. Physical keys, so macOS Option layouts work.    |
 | `Ctrl+Shift+{` / `Ctrl+Shift+}` | Move the active tab left / right.                                |
 | `Alt+B`                         | Collapse / expand the session sidebar, when that layout is on.    |
+| `Alt+Shift+C`                   | Switch a Claude session between Chat and Terminal view, when [the chat view](Settings-Reference#header--panels) applies to it. |
 
 `Ctrl+W` is not a Codeman shortcut: it goes to the terminal, where shells and agent CLIs
 use it to delete the previous word. **Close Session** has no key by default; close a session
@@ -38,6 +39,22 @@ from its tab, or bind a key to it in App Settings → Shortcuts.
 | `Ctrl+Z`                | Swallowed in agent sessions so a running CLI cannot be suspended. Normal job control in a shell. |
 
 Anything you copy is cleaned on the way to the clipboard: each line loses the padding spaces a full-screen program paints across the rest of the row. Leading indentation is left exactly as it is, so indented code, a `git log` message body and `git diff` context lines paste back the way they looked on screen. An `Alt+drag` rectangular selection is copied exactly as it looks, so its columns stay lined up.
+
+## Chat view
+
+The message box of [the chat view](Settings-Reference#header--panels) has keys of its own.
+
+| Shortcut                  | Action                                                       |
+| ------------------------- | ------------------------------------------------------------ |
+| `Enter`                   | Send. On a touch device `Enter` adds a line, and the Send button or `Ctrl+Enter` / `Cmd+Enter` sends. |
+| `Ctrl+Enter` / `Cmd+Enter` | Send, on any device.                                        |
+| `Shift+Enter`             | Insert a newline without sending.                            |
+| `Tab` in an empty box     | Fill in the prompt Claude suggests next, when it suggests one. It is never sent on its own. |
+| `/` at the start of the box | Open the command menu.                                     |
+| `Up` / `Down`             | In the command menu: move the highlight.                     |
+| `Tab`                     | In the command menu: complete the highlighted command.       |
+| `Enter`                   | In the command menu: complete the highlighted command. Once the word is already the command's whole name, `Enter` closes the menu and then acts as it does outside it: it sends on a desktop and adds a line on a touch device. |
+| `Escape`                  | In the command menu: close only the menu.                    |
 
 ## Tile grid
 
@@ -89,9 +106,20 @@ The terminal sees keystrokes before the app does. Any chord the app claims has t
 swallowed at the terminal layer, or xterm writes the control byte into the session as well
 as triggering the action. A chord **you** rebind an action to is kept out of the terminal
 too, so rebinding Previous Session to `Alt+J` switches the session and sends nothing to the
-CLI. The built-in defaults are deliberately not held back this way: `Ctrl+L` clears the
-screen and also reaches the CLI, which redraws on it. Binding an action back onto its own
-default behaves like the default.
+CLI. Several built-in defaults are held back too, each by a check of its own:
+
+- the tab switches (`Alt+1` to `Alt+9`, `Alt+[` and `Alt+]`) and the session finder
+  (`Ctrl+K`, `Alt+K`);
+- `Alt+B`, while the sidebar layout is on;
+- `Alt+Shift+C`, while the active session can show the chat view;
+- Copy Selection, whose `Ctrl+Shift+C` never reaches the CLI and whose `Ctrl+C` does not
+  while text is selected;
+- the tile grid chords.
+
+None of those chords types anything into the CLI when it acts as its shortcut; `Ctrl+C`
+with nothing selected is the interrupt and reaches the CLI. The other defaults still
+reach it: `Ctrl+L` clears the screen and also reaches the CLI, which redraws on it.
+Binding an action back onto its own default behaves like the default.
 
 `Alt+1` through `Alt+9` are matched on **physical key position** rather than the character
 produced, so macOS Option layouts that produce `¡™£` still switch tabs.

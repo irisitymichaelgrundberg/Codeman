@@ -114,6 +114,14 @@ export type HookEventType =
   // LIVE conversation id, reported by the CLI process itself, so it survives a
   // `/clear` without any cwd/timestamp correlation.
   | 'prompt_submitted'
+  // Claude Code's SessionStart hook with the `clear` matcher: `/clear` started a new
+  // conversation. Its `session_id` and `transcript_path` name the new one at once, where
+  // prompt_submitted would only report it with the next prompt.
+  | 'conversation_cleared'
+  // Claude Code's PreCompact and PostCompact hooks: the conversation is being compacted, by
+  // `/compact` or by Claude Code itself, and has been. Session.compacting carries it.
+  | 'compact_started'
+  | 'compact_finished'
   // No Claude Code hook behind this one: it is the DeepSeek status bridge's
   // "a turn STARTED" report (see deepseek-status-shim.ts). Keep in step with
   // HookEventSchema in web/schemas.ts.

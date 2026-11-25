@@ -247,6 +247,83 @@ describe('hook-event-routes', () => {
      * from the prompt-cache keep-alive (Session.markPromptSubmitted ends the keep-alive window
      * for anything but the nudge), so the route must hand it over, and nothing else.
      */
+    /**
+     * `/clear` opens a new conversation file, and the SessionStart `clear` hook names it at
+     * once: the session adopts it first-hand and the transcript watcher moves to its file, so
+     * the chat view shows the empty conversation before the next prompt.
+     */
+    it('follows a /clear at once from a conversation_cleared hook, without counting a submit', async () => {
+      const session = harness.ctx._session;
+      const before = session.lastSubmitAt;
+      const transcriptPath = '/home/u/.claude/projects/-w/conv-2.jsonl';
+
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: '/api/hook-event',
+        payload: {
+          event: 'conversation_cleared',
+          sessionId: harness.ctx._sessionId,
+          data: {
+            hook_event_name: 'SessionStart',
+            source: 'clear',
+            session_id: 'conv-2',
+            transcript_path: transcriptPath,
+          },
+        },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(session.claudeSessionId).toBe('conv-2');
+      expect(session.claudeSessionIdIsFirstHand).toBe(true);
+      expect(session.lastSubmitAt).toBe(before);
+      expect(harness.ctx.startTranscriptWatcher).toHaveBeenCalledWith(harness.ctx._sessionId, transcriptPath);
+      expect(harness.ctx.broadcast).toHaveBeenCalledWith(
+        'hook:conversation_cleared',
+        expect.objectContaining({ sessionId: harness.ctx._sessionId })
+      );
+    });
+
+    /**
+     * A compaction writes nothing to the transcript until it ends, so PreCompact and PostCompact
+     * are what tell the chat view it is running. Stop and a new prompt end it too: a compaction
+     * cancelled with Esc sends no PostCompact.
+     */
+    it('marks the session compacting between the PreCompact and PostCompact hooks', async () => {
+      const session = harness.ctx._session;
+      const send = (event: string, data: Record<string, unknown> = {}) =>
+        harness.app.inject({
+          method: 'POST',
+          url: '/api/hook-event',
+          payload: { event, sessionId: harness.ctx._sessionId, data },
+        });
+
+      expect((await send('compact_started', { hook_event_name: 'PreCompact', trigger: 'manual' })).statusCode).toBe(
+        200
+      );
+      expect(session.compacting).toBe(true);
+      expect(harness.ctx.broadcastSessionStateDebounced).toHaveBeenCalledWith(harness.ctx._sessionId);
+      await send('compact_finished', { hook_event_name: 'PostCompact', trigger: 'manual' });
+      expect(session.compacting).toBe(false);
+
+      for (const end of ['stop', 'prompt_submitted']) {
+        await send('compact_started', { trigger: 'auto' });
+        expect(session.compacting).toBe(true);
+        await send(end);
+        expect(session.compacting).toBe(false);
+      }
+    });
+
+    it('never marks a session compacting whose CLI does not run the hooks', async () => {
+      const session = harness.ctx._session;
+      session.mode = 'shell';
+      await harness.app.inject({
+        method: 'POST',
+        url: '/api/hook-event',
+        payload: { event: 'compact_started', sessionId: harness.ctx._sessionId, data: {} },
+      });
+      expect(session.compacting).toBe(false);
+    });
+
     it("hands the prompt_submitted hook's prompt text to the session", async () => {
       const session = harness.ctx._session;
       for (const data of [

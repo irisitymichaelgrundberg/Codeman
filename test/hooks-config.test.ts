@@ -78,6 +78,37 @@ describe('generateHooksConfig', () => {
     expect(command.trimEnd().endsWith('>/dev/null')).toBe(false);
   });
 
+  it('reports the new conversation right after /clear, through a silent SessionStart hook', () => {
+    const config = generateHooksConfig();
+    const entries = config.hooks.SessionStart as Array<{ matcher?: string; hooks: Array<{ command: string }> }>;
+    expect(entries).toHaveLength(1);
+    // Only `/clear`: a startup or resume already has a conversation id Codeman launched it with.
+    expect(entries[0].matcher).toBe('clear');
+    const command = entries[0].hooks[0].command;
+    expect(command).toContain('"event":"conversation_cleared"');
+    expect(command).toContain('$CODEMAN_SESSION_ID');
+    // A SessionStart hook's stdout becomes context for Claude, as UserPromptSubmit's does.
+    expect(command).toContain('curl -sk -o /dev/null -X POST');
+  });
+
+  it('reports a compaction starting and ending, through silent PreCompact and PostCompact hooks', () => {
+    const config = generateHooksConfig();
+    for (const [key, event] of [
+      ['PreCompact', 'compact_started'],
+      ['PostCompact', 'compact_finished'],
+    ] as const) {
+      const entries = config.hooks[key] as Array<{ matcher?: string; hooks: Array<{ command: string }> }>;
+      expect(entries).toHaveLength(1);
+      // No matcher: `/compact` (manual) and Claude Code's own auto-compaction both count.
+      expect(entries[0].matcher).toBeUndefined();
+      const command = entries[0].hooks[0].command;
+      expect(command).toContain(`"event":"${event}"`);
+      expect(command).toContain('curl -sk -o /dev/null -X POST');
+      // Exit 2 from a PreCompact hook blocks the compaction; the curl must never fail the hook.
+      expect(command.trimEnd().endsWith('|| true')).toBe(true);
+    }
+  });
+
   it("leaves every other hook event's command text byte-identical", () => {
     // The opt-in discard exists so the five SSE-fed events do not change shape:
     // rewriting their command churns every workspace's settings.local.json.
@@ -382,6 +413,36 @@ describe('writeHooksConfig', () => {
 
     const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
     expect(JSON.stringify(parsed.hooks.UserPromptSubmit)).toContain('prompt_submitted');
+  });
+
+  it('heals a hooks block written before the SessionStart clear hook existed', async () => {
+    const claudeDir = join(testDir, '.claude');
+    const settingsPath = join(claudeDir, 'settings.local.json');
+    mkdirSync(claudeDir, { recursive: true });
+    const hooks = generateHooksConfig().hooks;
+    delete hooks.SessionStart;
+    writeFileSync(settingsPath, JSON.stringify({ hooks }, null, 2));
+
+    await refreshStaleCodemanHooks(testDir);
+
+    const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(JSON.stringify(parsed.hooks.SessionStart)).toContain('conversation_cleared');
+  });
+
+  it('heals a hooks block written before the compaction hooks existed', async () => {
+    const claudeDir = join(testDir, '.claude');
+    const settingsPath = join(claudeDir, 'settings.local.json');
+    mkdirSync(claudeDir, { recursive: true });
+    const hooks = generateHooksConfig().hooks;
+    delete hooks.PreCompact;
+    delete hooks.PostCompact;
+    writeFileSync(settingsPath, JSON.stringify({ hooks }, null, 2));
+
+    await refreshStaleCodemanHooks(testDir);
+
+    const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(JSON.stringify(parsed.hooks.PreCompact)).toContain('compact_started');
+    expect(JSON.stringify(parsed.hooks.PostCompact)).toContain('compact_finished');
   });
 
   it('leaves an already-current hooks block untouched', async () => {

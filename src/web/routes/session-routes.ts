@@ -20,9 +20,10 @@ import {
   CLAUDE_BUILTIN_COMMANDS,
   mergeSlashCommands,
   parseSkillListings,
+  typedSlashCommand,
   type SlashCommand,
 } from '../../claude-slash-commands.js';
-import { readSlashCommandFiles } from '../../claude-slash-command-files.js';
+import { readSlashCommandFiles, type SlashCommandRoot } from '../../claude-slash-command-files.js';
 import {
   ApiErrorCode,
   createErrorResponse,
@@ -1092,6 +1093,14 @@ function wakeableHost(host: RemoteHost): WakeableRemote {
     extraSshOptions: host.extraSshOptions,
   };
 }
+
+/**
+ * The transcript path a `context=full` read started a session's watcher on, per session.
+ * A hook moves the watcher whenever its own path changes, but a session without working hooks
+ * never does, so after a `/clear` the read moves the watcher it started itself. A watcher whose
+ * path no longer matches the entry was moved by a hook, and from then on the read leaves it alone.
+ */
+const readStartedWatchers = new WeakMap<Session, string>();
 
 export function registerSessionRoutes(
   app: FastifyInstance,
@@ -3035,8 +3044,12 @@ export function registerSessionRoutes(
     const pushUserMessage = (text: string, timestamp: string | undefined, queued: boolean): void => {
       // A run of consecutive human inputs (a mid-turn queued burst) is ONE turn,
       // so the viewer renders it under one badge instead of one badge per line.
+      // The keep-warm nudge never joins an earlier user run: the turn before it
+      // may have ended without assistant text (an interrupt before Claude wrote
+      // anything, or a turn of tool calls only), and its reply belongs to the
+      // keep-alive turn, not to the user's prompt.
       const isNudge = text === KEEP_WARM_NUDGE;
-      if (messages.at(-1)?.role !== 'user') {
+      if (isNudge || messages.at(-1)?.role !== 'user') {
         turn += 1;
         keepAliveTurn = isNudge;
       } else if (!isNudge) {
@@ -3085,6 +3098,14 @@ export function registerSessionRoutes(
 
       if (entry.type === 'user') {
         const text = extractClaudeText(entry.message?.content, '\n').trim();
+        // A slash command the user typed is drawn as typed (`/dual-review`), not as its tags.
+        // `/clear` is left out: it opens the new, empty conversation it belongs to.
+        const typed = !entry.isMeta && text ? typedSlashCommand(text) : null;
+        if (typed !== null) {
+          if (!full || typed === '/clear' || currentUserFragments.has(typed)) continue;
+          pushUserMessage(typed, entry.timestamp, false);
+          continue;
+        }
         // A tool_result block has no text block and naturally drops out here.
         if (!text || isClaudeSyntheticUserMessage(entry, text)) continue;
         if (!full) continue;
@@ -3177,32 +3198,58 @@ export function registerSessionRoutes(
     }
   }
 
+  // Where each conversation's transcript was last found, keyed by projects folder and id. The scan
+  // below stats one path per project folder, and the chat view reads on every reload, so a hit here
+  // costs one stat. A path that no longer names a file is dropped and the scan runs again.
+  const transcriptPathCache = new LRUMap<string, string>({ maxSize: 256 });
+
   /** Locate a top-level Claude transcript, including recovered tmux sessions. */
   async function findClaudeTranscript(
     projectsDir: string,
     conversationId: string,
     codemanSessionId: string
   ): Promise<{ sessionId: string; path: string } | null> {
-    let projectDirs: import('node:fs').Dirent[];
-    try {
-      projectDirs = await fs.readdir(projectsDir, { withFileTypes: true });
-    } catch {
-      return null;
-    }
+    let projectDirs: import('node:fs').Dirent[] | null = null;
+    const readProjectDirs = async (): Promise<import('node:fs').Dirent[] | null> => {
+      if (projectDirs) return projectDirs;
+      try {
+        projectDirs = await fs.readdir(projectsDir, { withFileTypes: true });
+      } catch {
+        return null;
+      }
+      return projectDirs;
+    };
 
     const safeIds = [...new Set([conversationId, codemanSessionId])].filter((value) => /^[a-zA-Z0-9._-]+$/.test(value));
     for (const candidateId of safeIds) {
-      for (const projectDir of projectDirs) {
+      const cacheKey = `${projectsDir}\0${candidateId}`;
+      const cached = transcriptPathCache.get(cacheKey);
+      if (cached) {
+        const stat = await fs.stat(cached).catch(() => null);
+        if (stat?.isFile()) return { sessionId: candidateId, path: cached };
+        transcriptPathCache.delete(cacheKey);
+      }
+      const dirs = await readProjectDirs();
+      if (!dirs) return null;
+      for (const projectDir of dirs) {
         if (!projectDir.isDirectory()) continue;
         const jsonlPath = join(projectsDir, projectDir.name, `${candidateId}.jsonl`);
         try {
           const stat = await fs.stat(jsonlPath);
-          if (stat.isFile()) return { sessionId: candidateId, path: jsonlPath };
+          if (stat.isFile()) {
+            transcriptPathCache.set(cacheKey, jsonlPath);
+            return { sessionId: candidateId, path: jsonlPath };
+          }
         } catch {
           /* continue */
         }
       }
     }
+
+    // The fallback below is never cached: it picks among files by a prefix, and a new one can
+    // change the answer.
+    const allProjectDirs = await readProjectDirs();
+    if (!allProjectDirs) return null;
 
     // If mux-sessions.json was lost or stale, reconcileSessions() historically
     // recovered `codeman-40568a29` as `restored-40568a29` and used the server cwd.
@@ -3214,7 +3261,7 @@ export function registerSessionRoutes(
     const candidates: Array<{ sessionId: string; path: string; mtimeMs: number }> = [];
     const uuidPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 
-    for (const projectDir of projectDirs) {
+    for (const projectDir of allProjectDirs) {
       if (!projectDir.isDirectory()) continue;
       const dirPath = join(projectsDir, projectDir.name);
       let files: import('node:fs').Dirent[];
@@ -3374,10 +3421,25 @@ export function registerSessionRoutes(
 
     // The chat view lives on the watcher's events (tool starts, new lines). A watcher normally
     // starts at the session's first hook, so a session the server picked up mid-turn (a restart)
-    // has none until its next prompt or turn end. Start one from the file just found. Only when
-    // none runs: the hook's path stays the authority, and a remote session's file is not here.
-    if (context === 'full' && !session.remote && ctx.getTranscriptPath(session.id) === null) {
-      ctx.startTranscriptWatcher(session.id, transcript.path);
+    // has none until its next prompt or turn end. Start one from the file just found when none
+    // runs. A watcher this read started itself follows the conversation to its new file after a
+    // `/clear`, since no hook will move it. A watcher a hook started or moved is never touched:
+    // the hook's path stays the authority. A remote session's file is not here. The reads above
+    // await, so the session may have been deleted or detached meanwhile, and a watcher started
+    // for it then would never be stopped.
+    if (context === 'full' && !session.remote && ctx.sessions.get(session.id) === session) {
+      const current = ctx.getTranscriptPath(session.id);
+      if (current === null) {
+        ctx.startTranscriptWatcher(session.id, transcript.path);
+        readStartedWatchers.set(session, transcript.path);
+      } else if (readStartedWatchers.get(session) === current) {
+        if (current !== transcript.path) {
+          ctx.startTranscriptWatcher(session.id, transcript.path);
+          readStartedWatchers.set(session, transcript.path);
+        }
+      } else {
+        readStartedWatchers.delete(session);
+      }
     }
 
     try {
@@ -3433,7 +3495,9 @@ export function registerSessionRoutes(
 
     let listed: SlashCommand[] = [];
     const dirs = await claudeConversationDirs(session);
-    const hookPath = ctx.getTranscriptPath(session.id);
+    // A Docker session's hook reports the container's path, which the host cannot open, so its host
+    // copy is found by the scan below, as lastResponseFor() finds it.
+    const hookPath = session.docker ? null : ctx.getTranscriptPath(session.id);
     const transcriptPath =
       hookPath ??
       (dirs
@@ -3442,10 +3506,14 @@ export function registerSessionRoutes(
     if (transcriptPath) listed = await transcriptSkills(transcriptPath);
 
     // The workspace's own `.claude` first, then the user's config folder. A Docker session's
-    // config folder is the container's, so only its bind-mounted workspace is read here.
-    const roots: string[] = [];
-    if ((await probePathKind(session.workingDir)) === 'directory') roots.push(join(session.workingDir, '.claude'));
-    if (dirs && !session.docker) roots.push(dirname(dirs.projectsDir));
+    // config folder is the container's, so only its bind-mounted workspace is read here. A
+    // workspace file must resolve inside the workspace, so a link in it cannot list a file elsewhere.
+    const roots: SlashCommandRoot[] = [];
+    if ((await probePathKind(session.workingDir)) === 'directory') {
+      const workspace = await fs.realpath(session.workingDir).catch(() => null);
+      if (workspace) roots.push({ dir: join(session.workingDir, '.claude'), confineTo: workspace });
+    }
+    if (dirs && !session.docker) roots.push({ dir: dirname(dirs.projectsDir) });
     const onDisk = await readSlashCommandFiles(roots);
 
     return { success: true, data: { commands: mergeSlashCommands(listed, onDisk, [...CLAUDE_BUILTIN_COMMANDS]) } };

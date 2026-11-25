@@ -5,7 +5,7 @@
  * and referenced by the frontend (`SSE_EVENTS` in `constants.js`).
  * Both files MUST be kept in sync.
  *
- * 165 event constants organized by category:
+ * 169 event constants organized by category:
  * - **Core** (1): init
  * - **Transport** (1): sse:heartbeat
  * - **Session lifecycle** (26): created, updated, deleted, terminal, idle, working, ...
@@ -25,7 +25,7 @@
  * - **Plan orchestration** (5): started, progress, subagent, completed, cancelled
  * - **Tunnel** (7): started, stopped, progress, error, qrRotated, qrRegenerated, qrAuthUsed
  * - **Image / attachments** (2): image:detected, attachment:detected
- * - **Hooks** (10): idle_prompt, permission_prompt, elicitation_dialog, elicitation_complete, elicitation_response, stop, agent_working, teammate_idle, task_completed, prompt_submitted
+ * - **Hooks** (13): idle_prompt, permission_prompt, elicitation_dialog, elicitation_complete, elicitation_response, stop, agent_working, teammate_idle, task_completed, prompt_submitted, conversation_cleared, compact_started, compact_finished
  *   (agent_working is the odd one out: reported by the DeepSeek Harness status bridge, not by a Claude Code hook;
  *   permission_prompt also arrives with `source: 'screen'` for a codex dialog read off its screen)
  * - **Approvals** (3): pending, updated, resolved (cross-session Approvals Inbox)
@@ -405,6 +405,12 @@ export const HookTeammateIdle = 'hook:teammate_idle' as const;
 export const HookTaskCompleted = 'hook:task_completed' as const;
 /** UserPromptSubmit fired in a Claude pane (#367): the pane learned its live conversation id first-hand. */
 export const HookPromptSubmitted = 'hook:prompt_submitted' as const;
+/** `/clear` started a new conversation; `session_id` and `transcript_path` name it. */
+export const HookConversationCleared = 'hook:conversation_cleared' as const;
+/** PreCompact: Claude Code started compacting the conversation, by /compact or by auto-compaction. */
+export const HookCompactStarted = 'hook:compact_started' as const;
+/** PostCompact: the compaction finished. */
+export const HookCompactFinished = 'hook:compact_finished' as const;
 
 // ─── Approvals Inbox ─────────────────────────────────────────────────────────
 

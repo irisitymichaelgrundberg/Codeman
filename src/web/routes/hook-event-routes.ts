@@ -270,6 +270,16 @@ export function registerHookEventRoutes(
       }
     }
 
+    // A compaction in progress, for the chat view's status line (SessionState.compacting). The
+    // state broadcast below carries the change. Mode-gated like the wait signals: only a session
+    // whose CLI runs Codeman's hooks can be compacting.
+    if (session && hooksAvailableForMode(session.mode, sessionHookOptions(session))) {
+      if (event === 'compact_started') session.setCompacting(true);
+      else if (event === 'compact_finished' || event === 'stop' || event === 'prompt_submitted') {
+        session.setCompacting(false);
+      }
+    }
+
     acknowledgedReason ??= keepAliveReason;
     // The keep-alive turn's own idle prompt is the last thing it sends, so the window ends here
     // rather than on a fixed clock that a slow turn could outlast.

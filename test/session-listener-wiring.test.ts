@@ -94,6 +94,29 @@ describe('session listener wiring', () => {
     expect(broadcast).toHaveBeenCalledWith(SseEvent.SessionIdle, { id: session.id, ...flag });
   });
 
+  it('starts the prompt-suggestion reader on idle and clears it on working', () => {
+    const session = new Session({ id: 'wiring-prompt-suggestion', workingDir: '/tmp', mode: 'claude' });
+    const promptSuggestionIdle = vi.fn();
+    const promptSuggestionWorking = vi.fn();
+    const deps = {
+      broadcast: vi.fn(),
+      broadcastSessionStateDebounced: vi.fn(),
+      getRunSummaryTracker: vi.fn(() => undefined),
+      promptSuggestionIdle,
+      promptSuggestionWorking,
+    } as unknown as Parameters<typeof createSessionListeners>[1];
+    const refs = createSessionListeners(session, deps);
+
+    refs.idle();
+    expect(promptSuggestionIdle).toHaveBeenCalledWith('wiring-prompt-suggestion');
+    expect(promptSuggestionWorking).not.toHaveBeenCalled();
+
+    refs.working();
+    expect(promptSuggestionWorking).toHaveBeenCalledWith('wiring-prompt-suggestion');
+    expect(promptSuggestionIdle).toHaveBeenCalledTimes(1);
+    approvalInbox.resolveForSession(session.id, 'dismissed');
+  });
+
   /** The listener reads the setting asynchronously; let its promise chain settle. */
   const flush = () => new Promise((resolve) => setTimeout(resolve, 5));
 

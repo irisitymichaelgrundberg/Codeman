@@ -9,18 +9,29 @@
  * Port: N/A
  */
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import {
+  mkdirSync,
+  mkdtempSync,
+  promises as fsPromises,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  CLAUDE_BUILTIN_COMMANDS,
   cleanText,
   mergeSlashCommands,
   parseSkillFile,
   parseSkillListings,
   SLASH_DESCRIPTION_MAX_CHARS,
+  typedSlashCommand,
 } from '../src/claude-slash-commands.js';
-import { readSlashCommandFiles } from '../src/claude-slash-command-files.js';
+import { MAX_TOTAL_ENTRIES, MAX_TOTAL_FILES, readSlashCommandFiles } from '../src/claude-slash-command-files.js';
 
 const row = (names: string[], content: string, isInitial?: boolean) =>
   JSON.stringify({ type: 'attachment', attachment: { type: 'skill_listing', names, content, isInitial } });
@@ -111,8 +122,134 @@ describe('readSlashCommandFiles', () => {
     write(join(root, 'commands', 'top.md'), 'Top command');
     write(join(root, 'commands', 'a', 'b', 'deep.md'), 'Two folders down');
     write(join(root, 'commands', 'a', 'b', 'c', 'too-deep.md'), 'Three folders down');
-    return readSlashCommandFiles([root, join(root, 'missing')]).then((list) => {
+    return readSlashCommandFiles([{ dir: root }, { dir: join(root, 'missing') }]).then((list) => {
       expect(list.map((c) => c.name).sort()).toEqual(['a:b:deep', 'one', 'top']);
     });
+  });
+
+  const write = (path: string, text: string) => {
+    mkdirSync(join(path, '..'), { recursive: true });
+    writeFileSync(path, text);
+  };
+
+  it('follows a link out of a confined workspace to nothing, and a link inside it as usual', async () => {
+    const workspace = join(root, 'workspace');
+    const outside = join(root, 'outside');
+    write(join(outside, 'secret.md'), 'The first line of a private file');
+    write(join(outside, 'skill', 'SKILL.md'), '---\ndescription: Outside skill\n---\n');
+    write(join(workspace, 'notes', 'inside.md'), 'Inside command');
+    mkdirSync(join(workspace, '.claude', 'commands'), { recursive: true });
+    mkdirSync(join(workspace, '.claude', 'skills'), { recursive: true });
+    symlinkSync(join(outside, 'secret.md'), join(workspace, '.claude', 'commands', 'k.md'));
+    symlinkSync(join(outside, 'skill'), join(workspace, '.claude', 'skills', 'x'));
+    symlinkSync(join(workspace, 'notes', 'inside.md'), join(workspace, '.claude', 'commands', 'in.md'));
+
+    const list = await readSlashCommandFiles([{ dir: join(workspace, '.claude'), confineTo: realpathSync(workspace) }]);
+    expect(list.map((c) => c.name)).toEqual(['in']);
+  });
+
+  it('reads nothing when the link points elsewhere by the time the file opens', async () => {
+    const workspace = join(root, 'workspace');
+    const outside = join(root, 'outside');
+    write(join(outside, 'secret.md'), 'SECRET-LINE of a private file');
+    write(join(workspace, 'notes', 'inside.md'), 'Inside command');
+    mkdirSync(join(workspace, '.claude', 'commands'), { recursive: true });
+    const link = join(workspace, '.claude', 'commands', 'k.md');
+    symlinkSync(join(outside, 'secret.md'), link);
+
+    // A rewritten link is hard to time, so the realpath check is made to see the link pointing
+    // inside the workspace while the open follows it out.
+    const realpath = fsPromises.realpath;
+    const spy = vi
+      .spyOn(fsPromises, 'realpath')
+      .mockImplementation((async (p: string) =>
+        p === link ? realpathSync(join(workspace, 'notes', 'inside.md')) : realpath(p)) as typeof realpath);
+    try {
+      const list = await readSlashCommandFiles([
+        { dir: join(workspace, '.claude'), confineTo: realpathSync(workspace) },
+      ]);
+      expect(spy).toHaveBeenCalledWith(link);
+      expect(list.map((c) => c.name)).not.toContain('k');
+      expect(list.some((c) => (c.description ?? '').includes('SECRET-LINE'))).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('skips a FIFO named like a skill or command file without blocking', async () => {
+    try {
+      execFileSync('mkfifo', ['--help'], { stdio: 'ignore' });
+    } catch {
+      return; // no mkfifo on this machine
+    }
+    mkdirSync(join(root, 'skills', 'x'), { recursive: true });
+    mkdirSync(join(root, 'commands'), { recursive: true });
+    execFileSync('mkfifo', [join(root, 'skills', 'x', 'SKILL.md')]);
+    execFileSync('mkfifo', [join(root, 'commands', 'f.md')]);
+    write(join(root, 'commands', 'ok.md'), 'A real command');
+
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('the scan blocked on a FIFO')), 2000);
+    });
+    try {
+      const list = await Promise.race([readSlashCommandFiles([{ dir: root }]), timeout]);
+      expect(list.map((c) => c.name)).toEqual(['ok']);
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
+  it('stops opening files once the call has opened its budget of them', async () => {
+    for (const folder of ['a', 'b', 'c']) {
+      for (let i = 0; i < 200; i++) write(join(root, 'commands', folder, `c${i}.md`), `Command ${i}`);
+    }
+    const list = await readSlashCommandFiles([{ dir: root }, { dir: root }]);
+    expect(list).toHaveLength(MAX_TOTAL_FILES);
+  });
+
+  it('stops listing folders once the call has looked at its budget of entries', async () => {
+    // Twelve folders of 200 entries each, one command per folder: more entries than the budget.
+    const folders = 12;
+    for (let f = 0; f < folders; f++) {
+      const dir = join(root, 'commands', `d${f}`);
+      for (let i = 0; i < 199; i++) write(join(dir, `x${i}.txt`), '');
+      write(join(dir, 'z.md'), `Command in folder ${f}`);
+    }
+    expect(folders * 200).toBeGreaterThan(MAX_TOTAL_ENTRIES);
+    const list = await readSlashCommandFiles([{ dir: root }]);
+    // The budget covers the folder list and nine whole folders, and part of a tenth at most.
+    expect(list.length).toBeGreaterThanOrEqual(9);
+    expect(list.length).toBeLessThanOrEqual(10);
+  });
+});
+
+describe('typedSlashCommand', () => {
+  it('reads a typed command from its transcript tags, in either order, with its arguments', () => {
+    expect(
+      typedSlashCommand('<command-message>dual-review</command-message>\n<command-name>/dual-review</command-name>')
+    ).toBe('/dual-review');
+    expect(
+      typedSlashCommand(
+        '<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>opus</command-args>'
+      )
+    ).toBe('/model opus');
+    expect(typedSlashCommand('<command-name>/clear</command-name><command-args></command-args>')).toBe('/clear');
+  });
+
+  it('gives null for anything else', () => {
+    expect(typedSlashCommand('please run <command-name>/x</command-name>')).toBeNull();
+    expect(typedSlashCommand('<local-command-stdout>done</local-command-stdout>')).toBeNull();
+    expect(typedSlashCommand('<command-name>/bad name</command-name>')).toBeNull();
+    expect(typedSlashCommand('<command-name>/-x</command-name>')).toBeNull();
+    expect(typedSlashCommand(`<command-name>/${'a'.repeat(101)}</command-name>`)).toBeNull();
+  });
+});
+
+describe('CLAUDE_BUILTIN_COMMANDS', () => {
+  it('marks the built-ins whose bare form opens a picker in the terminal, and not the others', () => {
+    const opens = new Set(CLAUDE_BUILTIN_COMMANDS.filter((c) => c.opensTerminal).map((c) => c.name));
+    for (const name of ['model', 'config', 'resume', 'mcp', 'permissions']) expect(opens.has(name)).toBe(true);
+    for (const name of ['clear', 'compact', 'recap', 'rename']) expect(opens.has(name)).toBe(false);
   });
 });

@@ -24,7 +24,7 @@
  * Pure apart from the injected capture, send and log, so the schedule, the cap and
  * every stop condition are unit-tested with fake timers (test/session-submit-verifier.test.ts).
  */
-import { stripAnsi } from './utils/index.js';
+import { oneLineText, stripAnsi } from './utils/index.js';
 
 /**
  * When to look, counted from the write: 2 s catches the common case (taken) with one
@@ -170,15 +170,8 @@ export function composerSuggestion(screen: string, glyph: string): string | null
   const lines = plainFrame(splitSuggestion(screen).suggestion).split('\n');
   // The glyph line's own glyph is not faint, so it is not in `lines`; continuation lines are
   // indented, and the indent collapses with the rest of the whitespace.
-  const text = lines
-    .slice(span.at, span.end)
-    .join(' ')
-    // eslint-disable-next-line no-control-regex
-    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!text) return null;
-  return text.length > PROMPT_SUGGESTION_MAX_CHARS ? text.slice(0, PROMPT_SUGGESTION_MAX_CHARS) : text;
+  const text = oneLineText(lines.slice(span.at, span.end).join(' '), PROMPT_SUGGESTION_MAX_CHARS, false);
+  return text || null;
 }
 
 export interface SubmitVerifierDeps {

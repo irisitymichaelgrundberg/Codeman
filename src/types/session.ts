@@ -1185,17 +1185,28 @@ export interface SessionState {
   /**
    * What the CLI's statusline shows under its composer, for the chat view: the user's own
    * statusline output (SGR colour sequences kept, everything else stripped by
-   * statusline-text.ts) or Codeman's own footer. Absent until the first report. Not
-   * persisted: the next render reports it again. Untrusted display text: render as text.
+   * statusline-text.ts) or Codeman's own footer. Absent until the first report. Persisted,
+   * and restored after a restart until the next report replaces it, because an idle Claude
+   * session runs its statusline command again only on its next turn. Untrusted display text:
+   * render as text.
    */
   statusLine?: string;
   /**
    * The next prompt the CLI suggests in its empty composer (Claude Code draws it faint), read
    * off the pane after a turn ends, for the chat view's message box. Absent when there is none,
-   * and cleared when a turn starts. Not persisted. Model text: render as text, never send it
-   * without the user.
+   * and cleared when a turn starts. Written to state.json with the rest of the session state,
+   * but never read back: the next turn end reads it again. Model text: render as text, never
+   * send it without the user.
    */
   promptSuggestion?: string;
+  /**
+   * True while Claude Code compacts the conversation: its PreCompact hook fired and its
+   * PostCompact hook has not yet. A compaction writes nothing to the transcript until it ends,
+   * so this is how the chat view can say what the busy session is doing. Cleared by
+   * PostCompact, by the Stop hook, by a new prompt, and when the session goes idle, so a
+   * compaction cancelled with Esc does not leave it set. Absent when false; never read back.
+   */
+  compacting?: boolean;
   /** Sanitized per-session attachment history. */
   attachmentHistory?: SessionAttachmentHistoryItem[];
   /**

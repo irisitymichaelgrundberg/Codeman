@@ -5,7 +5,8 @@
  * frontend SSE_EVENTS object (src/web/public/constants.js) stay in sync. They are
  * hand-maintained in two files with no build-time link, so this asserts the set of
  * event-string VALUES matches exactly — a drift here means the UI silently ignores
- * (or never receives) an event.
+ * (or never receives) an event. It also asserts that every event the hook route
+ * accepts has a registry entry, since that route broadcasts each one as `hook:<event>`.
  *
  * No port needed (pure file/module comparison).
  */
@@ -13,6 +14,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import * as SseEvents from '../src/web/sse-events.js';
+import { HookEventSchema } from '../src/web/schemas.js';
 
 /** Every `export const X = '...' as const` in sse-events.ts is an event string. */
 function backendEventValues(): Set<string> {
@@ -63,5 +65,12 @@ describe('SSE event registry parity (backend ⇄ frontend)', () => {
 
   it('the two registries are exactly equal in size', () => {
     expect(frontend.size).toBe(backend.size);
+  });
+
+  // The hook route broadcasts every event its schema accepts as `hook:<event>`
+  // (hook-event-routes.ts), so each one needs a registry entry.
+  it('has a backend constant for every hook event the hook route accepts', () => {
+    const missing = HookEventSchema.shape.event.options.map((e) => `hook:${e}`).filter((e) => !backend.has(e));
+    expect(missing, `hook events with no constant in sse-events.ts: ${missing.join(', ')}`).toEqual([]);
   });
 });

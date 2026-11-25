@@ -20,6 +20,8 @@
  * and the browser sets both with `textContent` only.
  */
 
+import { oneLineText } from './utils/index.js';
+
 export type SlashCommandKind = 'builtin' | 'skill' | 'command';
 
 export interface SlashCommand {
@@ -27,6 +29,12 @@ export interface SlashCommand {
   name: string;
   description: string;
   kind: SlashCommandKind;
+  /**
+   * A built-in that, typed with nothing after it, opens a picker or a panel inside Claude's
+   * terminal interface (`/model`, `/config`), which the chat view cannot draw. The chat view
+   * shows the terminal for it.
+   */
+  opensTerminal?: boolean;
 }
 
 /** Longest description sent, in UTF-16 code units, before the ellipsis. */
@@ -36,52 +44,56 @@ export const SLASH_COMMANDS_MAX = 400;
 
 /** A name Claude Code accepts after `/`: letters, digits, `-`, `_`, `.` and `:` separators. */
 const COMMAND_NAME = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/;
-// eslint-disable-next-line no-control-regex
-const CONTROL_CHARS = /[\u0000-\u001f\u007f]+/g;
 
 /**
  * The built-in commands worth offering from a message box, with the CLI's own descriptions
  * (read from Claude Code 2.1.331). Commands that only make sense inside the terminal UI
- * (`/theme`, `/vim`, `/copy`, `/exit`) are left out; typing one still sends it.
+ * (`/theme`, `/vim`, `/copy`, `/exit`) are left out; typing one still sends it. A third entry of
+ * `true` marks a command whose bare form opens a picker or panel in the terminal: the CLI
+ * registers those as interface (`local-jsx`) commands, or, like `/model` and `/resume`, opens a
+ * picker when given no argument.
  */
-export const CLAUDE_BUILTIN_COMMANDS: readonly SlashCommand[] = [
-  ['add-dir', 'Add a working directory'],
-  ['advisor', 'Let Claude consult a stronger model at key moments'],
-  ['btw', 'Ask a side question without interrupting Claude'],
-  ['clear', 'Start a new session with empty context; the old one stays in /resume'],
-  ['compact', 'Free up context by summarizing the conversation so far'],
-  ['config', 'Open settings'],
-  ['context', 'Show what fills the context'],
-  ['effort', "Set the model's effort level"],
-  ['export', 'Export this session to a file or clipboard'],
-  ['goal', 'Set a goal Claude checks before stopping'],
-  ['help', 'Show help and available commands'],
-  ['hooks', 'View hook configurations for tool events'],
-  ['mcp', 'Manage MCP servers'],
-  ['memory', 'Edit CLAUDE.md files and memory settings'],
-  ['model', 'Set the AI model for Claude Code'],
-  ['output-style', 'List output styles or switch to one'],
-  ['permissions', 'Manage allow and deny tool permission rules'],
-  ['plan', 'Turn on plan mode or view the plan'],
-  ['plugin', 'Manage Claude Code plugins'],
-  ['recap', 'Generate a one-line session recap now'],
-  ['reload-skills', 'Pick up skills added or changed on disk during this session'],
-  ['rename', 'Rename the current conversation'],
-  ['resume', 'Resume an earlier conversation'],
-  ['rewind', 'Restore earlier code, conversation, or both'],
-  ['skills', 'List available skills'],
-  ['status', 'Show version, account, model, MCP servers, and setup warnings'],
-  ['tasks', "View and manage this session's background work"],
-  ['usage', 'Show session cost, plan usage, and activity stats'],
-].map(([name, description]) => ({ name, description, kind: 'builtin' as const }));
+export const CLAUDE_BUILTIN_COMMANDS: readonly SlashCommand[] = (
+  [
+    ['add-dir', 'Add a working directory', true],
+    ['advisor', 'Let Claude consult a stronger model at key moments', true],
+    ['btw', 'Ask a side question without interrupting Claude'],
+    ['clear', 'Start a new session with empty context; the old one stays in /resume'],
+    ['compact', 'Free up context by summarizing the conversation so far'],
+    ['config', 'Open settings', true],
+    ['context', 'Show what fills the context', true],
+    ['effort', "Set the model's effort level", true],
+    ['export', 'Export this session to a file or clipboard', true],
+    ['goal', 'Set a goal Claude checks before stopping', true],
+    ['help', 'Show help and available commands', true],
+    ['hooks', 'View hook configurations for tool events', true],
+    ['mcp', 'Manage MCP servers', true],
+    ['memory', 'Edit CLAUDE.md files and memory settings', true],
+    ['model', 'Set the AI model for Claude Code', true],
+    ['output-style', 'List output styles or switch to one', true],
+    ['permissions', 'Manage allow and deny tool permission rules', true],
+    ['plan', 'Turn on plan mode or view the plan', true],
+    ['plugin', 'Manage Claude Code plugins', true],
+    ['recap', 'Generate a one-line session recap now'],
+    ['reload-skills', 'Pick up skills added or changed on disk during this session'],
+    ['rename', 'Rename the current conversation'],
+    ['resume', 'Resume an earlier conversation', true],
+    ['rewind', 'Restore earlier code, conversation, or both', true],
+    ['skills', 'List available skills', true],
+    ['status', 'Show version, account, model, MCP servers, and setup warnings', true],
+    ['tasks', "View and manage this session's background work", true],
+    ['usage', 'Show session cost, plan usage, and activity stats', true],
+  ] as Array<[string, string, boolean?]>
+).map(([name, description, opensTerminal]) => ({
+  name,
+  description,
+  kind: 'builtin' as const,
+  ...(opensTerminal && { opensTerminal: true }),
+}));
 
 /** One line of text, control characters removed, capped at {@link SLASH_DESCRIPTION_MAX_CHARS}. */
 export function cleanText(value: string): string {
-  const flat = String(value ?? '')
-    .replace(CONTROL_CHARS, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return flat.length > SLASH_DESCRIPTION_MAX_CHARS ? `${flat.slice(0, SLASH_DESCRIPTION_MAX_CHARS)}…` : flat;
+  return oneLineText(String(value ?? ''), SLASH_DESCRIPTION_MAX_CHARS);
 }
 
 export function isCommandName(name: string): boolean {
@@ -194,4 +206,23 @@ export function mergeSlashCommands(...sources: SlashCommand[][]): SlashCommand[]
     }
   }
   return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name)).slice(0, SLASH_COMMANDS_MAX);
+}
+
+const COMMAND_NAME_TAG = /<command-name>\s*\/?([^<\s]+)\s*<\/command-name>/;
+const COMMAND_ARGS_TAG = /<command-args>([\s\S]*?)<\/command-args>/;
+
+/**
+ * The slash command a transcript user row records, as the user typed it (`/name args`), or null
+ * when the row is not one. Claude Code writes a typed command as tags, in either order:
+ * `<command-message>name</command-message><command-name>/name</command-name>` and, for a
+ * built-in, `<command-args>…</command-args>` too (measured on 2.1.331). A skill's body follows
+ * in a separate `isMeta` row, which the reader leaves out.
+ */
+export function typedSlashCommand(text: string): string | null {
+  const trimmed = text.trimStart();
+  if (!trimmed.startsWith('<command-name>') && !trimmed.startsWith('<command-message>')) return null;
+  const name = COMMAND_NAME_TAG.exec(trimmed)?.[1];
+  if (!name || !isCommandName(name)) return null;
+  const args = (COMMAND_ARGS_TAG.exec(trimmed)?.[1] ?? '').trim();
+  return args ? `/${name} ${args}` : `/${name}`;
 }

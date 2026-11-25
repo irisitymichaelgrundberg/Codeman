@@ -11,6 +11,8 @@
  * agent wrote it), and the browser sets it with `textContent` only.
  */
 
+import { oneLineText } from './utils/index.js';
+
 /** Longest detail sent, in UTF-16 code units, before the ellipsis. */
 export const TOOL_DETAIL_MAX_CHARS = 160;
 
@@ -36,13 +38,9 @@ const DETAIL_FIELDS: Record<string, readonly string[]> = {
 /** Fields tried, in order, for a tool this module has no entry for (MCP tools, newer tools). */
 const FALLBACK_FIELDS = ['file_path', 'path', 'command', 'pattern', 'query', 'url', 'description'] as const;
 
-/** Control characters, line breaks included: none of them belongs in a one-line status. */
-// eslint-disable-next-line no-control-regex
-const CONTROL_CHARS = /[\u0000-\u001f\u007f]+/g;
-
+/** Control characters and line breaks have no place in a one-line status. */
 function clean(value: string): string {
-  const flat = value.replace(CONTROL_CHARS, ' ').replace(/\s+/g, ' ').trim();
-  return flat.length > TOOL_DETAIL_MAX_CHARS ? `${flat.slice(0, TOOL_DETAIL_MAX_CHARS)}…` : flat;
+  return oneLineText(value, TOOL_DETAIL_MAX_CHARS);
 }
 
 function field(input: Record<string, unknown>, name: string): string | undefined {
@@ -79,4 +77,30 @@ export function summarizeToolCall(name: string, input: unknown): string | undefi
     if (value) return clean(value);
   }
   return undefined;
+}
+
+/** The `transcript:tool_start` broadcast's payload, `detail` and `command` only when present. */
+export interface ToolStartPayload {
+  sessionId: string;
+  toolName: string;
+  detail?: string;
+  command?: string;
+  timestamp: number;
+}
+
+/**
+ * The payload broadcast when the transcript watcher reports a tool call. `detail` names what the
+ * call works on (the file, the command), for the chat view's status line. A Bash call with a
+ * description also carries its `command`, which the chat view shows under it as the CLI does.
+ */
+export function toolStartPayload(sessionId: string, toolName: string, input: unknown, now: number): ToolStartPayload {
+  const detail = summarizeToolCall(toolName, input);
+  const command = toolCallCommand(toolName, input);
+  return {
+    sessionId,
+    toolName,
+    ...(detail ? { detail } : {}),
+    ...(command ? { command } : {}),
+    timestamp: now,
+  };
 }

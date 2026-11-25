@@ -601,6 +601,59 @@ request returns. The capture runs synchronous tmux calls on the server; the
 | `lines=<n>` | With `full=1` only: read at most `<n>` lines of tmux history above the visible frame. An integer of at least 1, clamped to the configured history limit; absent or malformed, the whole limit (100,000 lines by default), as before. When a bound below the configured limit left older lines in tmux (its `history_size` is deeper), `truncated` is true with `truncationReason: 'tail'`; a byte cap still reports `'capped'`. Without it a full capture reads all of that history before `tail` cuts it, so a client that keeps a fixed number of lines (the tile grid sends its xterm's scrollback plus its rows) should send it. |
 | `alt=recording` | With `full=1` only: if the pane is in the alternate screen (a nested tmux, where tmux keeps no history, or any full-screen app such as vim or less while it is open), answer with the visible frame over the byte recording instead (`source: 'mux-visible'`, `tail` applied as without `full=1`). Shells' automatic loads send it. |
 
+## Conversation reads for the chat view
+
+### `GET /api/v1/sessions/:id/last-response?context=full`
+
+With `context=full`, the response carries the whole conversation as `messages`. Each
+message read from a Claude transcript has `kind`, `label`, `role`, `text`, `turn` and,
+when known, `timestamp`. A prompt the user typed while Claude was working also carries
+`queued: true`. That reader also marks the turns that Codeman's prompt-cache
+keep-warm sent. The nudge prompt and the reply to it both carry `keepAlive: true`, so a
+client can leave them out as the chat view does. A prompt the user queued during that
+turn makes the turn theirs, and its later messages carry no flag.
+
+A full read of a Claude transcript also starts a transcript watcher when none runs for
+the session. A watcher normally starts at the session's first hook, so a session picked
+up after a server restart has none until its next prompt or turn end. The read starts
+one from the file it found, and the session's `transcript:*` events then flow mid-turn.
+After a `/clear`, a read moves a watcher it started itself to the conversation's new
+file. It never replaces or moves a watcher a hook started, and it starts none for a
+remote SSH session, whose transcript is not on this host.
+
+### `GET /api/v1/sessions/:id/slash-commands`
+
+The route lists the slash commands the chat view's `/` menu offers for a session:
+
+```json
+{
+  "success": true,
+  "data": {
+    "commands": [
+      { "name": "compact", "description": "Free up context by summarizing the conversation so far", "kind": "builtin" }
+    ]
+  }
+}
+```
+
+`name` has no leading `/`, and a plugin's skill keeps its `plugin:` prefix. `kind` is
+`builtin`, `skill` or `command`. A built-in whose bare form opens a picker or a panel
+inside Claude's terminal interface, such as `/model` or `/config`, also carries
+`opensTerminal: true`. Every other entry leaves the field out. The list merges three sources, and the first source to
+name a command wins:
+
+1. The `skill_listing` rows of the session's transcript, which list the skills and prompt
+   commands Claude Code offers.
+2. Skill and command files in the workspace's `.claude` folder and in the user's Claude
+   config folder. A Docker session reads only its workspace, because its config folder
+   is the container's.
+3. The built-in commands Claude Code handles itself.
+
+The answer is sorted by name and carries at most 400 entries. Every file read is
+bounded. Descriptions are text from files somebody else wrote, so render them as text.
+A session whose CLI does not write a Claude-format transcript (`capabilities.transcript`
+other than `claude-jsonl`) gets an empty list. So do remote SSH and adopted sessions.
+
 ## Experimental bounded agent inspection and guarded input
 
 **Experimental:** `codeman agent inspect`, `stage` and `submit`, and their
@@ -1159,6 +1212,37 @@ or 1000000 with extended context), absent until a report carries it and dropped,
 is stored as the window, and Session Options stops its two inputs there. The thresholds
 themselves are compared with the report's `context_window.total_input_tokens`, cache reads
 included, and with the session's token counter for a launch without the exporter.
+
+## Chat view state (`statusLine`, `promptSuggestion`, `compacting`)
+
+Three more optional fields of session state (`GET /api/v1/sessions`, `session:updated`)
+feed the chat view. All three are written to `state.json` with the rest of the session
+state. After a server restart, `statusLine` is restored until the session's next report
+replaces it, because an idle Claude session runs its statusline command again only on its
+next turn. The other two are never read back. `statusLine` and `promptSuggestion` are
+untrusted display text that a client must render as text.
+
+`statusLine` is what the CLI's statusline shows under its composer, for a CLI that
+reports statusline telemetry (Claude). When the user has a statusline command of their
+own, the exporter prints its output unchanged and posts a base64 copy of it as
+`rendered`. The server keeps that copy's text, line breaks and SGR
+colour sequences, and strips every other escape and control character. The text is at
+most 4 lines. Without a statusline of their own, the field holds Codeman's own footer,
+which is the statusline then. It is absent until the first report, and the change-only
+`session:statusLine` event carries each new value (`{ sessionId, text }`).
+
+`promptSuggestion` is the next prompt Claude Code suggests in its empty composer. Claude
+Code draws it faint and writes it nowhere else, so the server reads it off the pane at
+about 1.5, 4 and 10 seconds after each turn ends. It reads only a Claude session that is
+neither remote nor adopted, and only while at least one client holds an SSE connection.
+The field is absent when there is none, and a new turn clears it. It changes through
+`session:updated`. A client should never send it without the user.
+
+`compacting` is `true` while Claude Code compacts the conversation, by `/compact` or by
+its own auto-compaction, and absent otherwise. Claude Code's PreCompact hook sets it and
+its PostCompact hook clears it, both reported as `POST /api/hook-event` events
+(`compact_started`, `compact_finished`). The Stop hook, a new prompt and the session going
+idle clear it too. It changes through `session:updated`.
 
 ## Placing a new session in a tab group (`tabGroupId`)
 
@@ -1902,6 +1986,24 @@ message is `event: <name>` + `data: <json>`. The event-name registry
 the stable contract — event names are not renamed without a major bump. An
 optional `?sessions=<id,...>` filter suppresses only the high-volume terminal
 stream; lifecycle/metadata events are delivered to all clients regardless.
+
+### Events the chat view reads
+
+The server broadcasts these for a session whose transcript watcher runs, or whose
+statusline reports:
+
+- `transcript:update` (`{ sessionId, timestamp }`) says new lines arrived in the
+  session's transcript. The server throttles it to one per 750 ms per session. The first
+  update after a quiet spell goes out at once, and a burst after it collapses into one
+  trailing event.
+- `transcript:tool_start` (`{ sessionId, toolName, detail?, command?, timestamp }`) says
+  a tool call began. `detail` names what the call works on, such as the file, the
+  command or the search pattern, and is absent when the input names nothing worth
+  showing. `command` is present only for a Bash call that also has a description, which
+  is then the `detail`. Each is one line, capped at 160 characters. The agent wrote
+  both, so render them as text.
+- `session:statusLine` (`{ sessionId, text }`) carries a changed `statusLine` value, as
+  described under [Chat view state](#chat-view-state-statusline-promptsuggestion-compacting).
 
 ### `sse:heartbeat` (liveness)
 

@@ -175,6 +175,7 @@ import {
   type ReportedModel,
   type ReportedModelSource,
 } from './session-display-model.js';
+import { sanitizeStatusLineText } from './statusline-text.js';
 
 export type { BackgroundTask } from './task-tracker.js';
 export type { RalphTrackerState, RalphTodoItem, ActiveBashTool } from './types.js';
@@ -663,10 +664,12 @@ export class Session extends EventEmitter {
   private _watching: string | null = null;
   /** Last `prompt_cache` report from the statusline exporter; null until Claude sends one. */
   private _promptCache: PromptCacheStatus | null = null;
-  /** The statusline's text, for the chat view (see SessionState.statusLine). Runtime only. */
+  /** The statusline's text, for the chat view (see SessionState.statusLine). Restored after a restart. */
   private _statusLine = '';
   /** The CLI's suggested next prompt, for the chat view (see SessionState.promptSuggestion). Runtime only. */
   private _promptSuggestion = '';
+  /** Whether Claude Code is compacting the conversation (see SessionState.compacting). Runtime only. */
+  private _compacting = false;
   private _contextReport: ContextReport | null = null;
   /** Prompt-cache keep-warm opt-in; undefined = follow the app-wide default. Persisted. */
   private _keepWarmEnabled: boolean | undefined;
@@ -1028,6 +1031,8 @@ export class Session extends EventEmitter {
       displayModel?: DisplayModel;
       /** The previous run's last prompt-cache report, restored so the readout is not blank (see `promptCache`). */
       promptCache?: PromptCacheStatus;
+      /** The previous run's statusline text, restored so the chat view is not blank (see `statusLine`). */
+      statusLine?: string;
       /** This session was rebuilt from the tmux socket, so its metadata is a guess. */
       discoveredMuxSession?: boolean;
       /** Restored wall-clock ms of the pane's last output (recovery only; see `_wireActivityAt`). */
@@ -1231,6 +1236,10 @@ export class Session extends EventEmitter {
     // has passed renders as cold rather than stale-warm. Set directly, not via
     // setPromptCache, so recovery does not re-stamp a compaction it did not just observe.
     this._promptCache = config.promptCache ?? null;
+    // Last statusline text, restored for the same reason: an idle claude session runs its
+    // statusline command again only on its next turn, so the chat view would show none until
+    // then. Sanitized again, because state.json is a file anyone with the account can edit.
+    this._statusLine = typeof config.statusLine === 'string' ? sanitizeStatusLineText(config.statusLine) : '';
     // Never self-parent: a session pointing at itself would draw a zero-length
     // lineage arc under its own tab. Only reachable via the recovery path, where
     // both the id and the saved parent come from disk.
@@ -1819,6 +1828,18 @@ export class Session extends EventEmitter {
   setPromptSuggestion(text: string): boolean {
     if (text === this._promptSuggestion) return false;
     this._promptSuggestion = text;
+    return true;
+  }
+
+  /** Whether Claude Code is compacting the conversation right now (PreCompact seen, PostCompact not yet). */
+  get compacting(): boolean {
+    return this._compacting;
+  }
+
+  /** Mark a compaction as running or over; true when that changed (the caller broadcasts only a change). */
+  setCompacting(on: boolean): boolean {
+    if (on === this._compacting) return false;
+    this._compacting = on;
     return true;
   }
 
@@ -2521,6 +2542,7 @@ export class Session extends EventEmitter {
       displayModel: this.displayModel,
       statusLine: this._statusLine || undefined,
       promptSuggestion: this._promptSuggestion || undefined,
+      compacting: this._compacting || undefined,
       // COD-118: runtime-only — surfaced so the frontend can require explicit user
       // intent before restarting a crash-looped session. Deliberately NOT restored
       // by the constructor: a Codeman restart starts with a fresh breaker so boot
@@ -4299,6 +4321,9 @@ export class Session extends EventEmitter {
     this._isWorking = false;
     this._status = 'idle';
     this._lastPromptTime = Date.now();
+    // A compaction cancelled with Esc sends no PostCompact; the turn's end closes it. The state
+    // broadcast that follows `idle` carries the change.
+    this._compacting = false;
     // Only a finished turn proves omp has written its session file; a pane that is
     // merely ready has nothing to resolve yet and could claim a neighbour's file.
     if (turnEnded) this._maybeCaptureOmpSessionId();

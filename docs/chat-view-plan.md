@@ -23,10 +23,13 @@ Each Claude session gets two views of the same pane:
 - **Terminal** is today's xterm.js pane, unchanged.
 
 A toggle switches between them, and a keyboard shortcut does the same. The choice
-is remembered per session on this device. A per-device setting picks which view a
-new session opens in, so a user who prefers chat never has to switch by hand. The
-setting defaults to Terminal. Chat replaces the main view and still sends some
-dialogs to the terminal in phase 1, so nobody gets it without choosing it.
+is remembered per session on this device. The toggle floats at the top right of the
+terminal. A second per-device setting shows or hides it. It shows by default, and a
+user who never uses the chat view can turn it off. The shortcut still switches views
+while the toggle is hidden. A per-device setting picks the view for every session
+this browser has no choice for yet, so a user who prefers chat never has to switch by
+hand. The setting defaults to Terminal. Chat replaces the main view and still sends
+some dialogs to the terminal in phase 1, so nobody gets it without choosing it.
 
 Your own prompts show in full when they are short. A prompt longer than about 12
 lines, typically a pasted log or spec, shows its first 6 lines followed by
@@ -34,10 +37,22 @@ lines, typically a pasted log or spec, shows its first 6 lines followed by
 answers. Keep-warm nudges are hidden, as Read My Mind already drops them, because
 Codeman sent them and you did not.
 
-While the agent works, the chat view shows a status line under the last message,
-such as "Working: Bash". The transcript events carry only the tool's name, so the
-status line names the tool and not the file it touches. When a turn ends, the new
-answer appears as a rendered message.
+While the agent works, the chat view shows a status line under the last message.
+It names what the running tool works on, such as "Reading src/session.ts" or
+"Running npm test". A Bash call with a description shows the description, with the
+command on a second `$ …` line, as the CLI does. The status line can say this because
+`transcript:tool_start` carries `detail` and `command`, which `summarizeToolCall()` and
+`toolCallCommand()` in `src/tool-call-summary.ts` pick out of the call's input. Each
+block of Claude's answer appears as a rendered message as soon as Claude writes it to
+the transcript, so a long turn fills in while it runs.
+
+While Claude Code compacts the conversation, the status line says "Compacting
+conversation". A compaction runs for a minute or more and writes nothing to the
+transcript until it ends, so the server learns of it from Claude Code's PreCompact
+and PostCompact hooks (`compact_started`, `compact_finished`) and publishes it as
+`SessionState.compacting`. Both hooks fire for `/compact` and for Claude Code's own
+auto-compaction. A session whose workspace lacks those hooks, such as one with
+workspace hooks turned off, shows "Working" during a compaction.
 
 The chat view always shows the session's current conversation. After `/clear` it
 starts empty, as Claude itself does.
@@ -50,17 +65,20 @@ returns the whole conversation as prompt and response messages, each tagged with
 its turn number. The Response Viewer's "More" button uses it today, so the chat
 view needs no new reader for its first version.
 
-That reader keeps only text. It drops tool calls, tool results and thinking blocks.
-The chat view shows a turn's tool activity as one muted summary line, such as
+That reader keeps only text. It drops tool calls, tool results and thinking blocks,
+so in phase 1 the conversation shows prompts and answers only.
+
+Phase 2 adds a turn's tool activity as one muted summary line, such as
 "Read 9 files · edited 2 · ran 3 commands". A busy turn makes dozens of calls, and
 a line per call would push the answer far down the page. Clicking the summary
 expands it to one line per call ("Read src/session.ts", "Ran npm test"), and each
 of those expands to show the call's input. For edits, the Edit history panel also
 shows the diffs.
 
-The summary needs every call, so the parser emits a `tool` message for each
-`tool_use` block. The message type already exists for the CLIs whose conversation
-Codeman reads from the pane.
+The summary needs every call, so in phase 2 the parser emits a `tool` message for
+each `tool_use` block. The message type already exists: the DeepSeek transcript
+reader and the readers for the CLIs whose conversation Codeman reads from the pane
+emit it.
 
 Reading the whole file on every update gets slow for a long conversation. Phase 1
 re-reads it, debounced, which is fine for typical sizes. Phase 3 adds a cursor, so
@@ -68,17 +86,28 @@ the browser asks only for messages after the last one it has.
 
 ## How the view stays live
 
-The server watches a Claude session's transcript once a hook has reported the
-transcript's path. Codeman installs those hooks in every Claude workspace unless
-`workspaceHooksEnabled` is off. The watcher already emits an internal
-`transcript:update` event whenever new lines arrive, but the server does not
-broadcast it. Phase 1 adds a throttled SSE event for it, so the browser learns of
-each new message while a turn is still running.
+The server watches a Claude session's transcript. A watcher starts at the session's
+first hook, which reports the transcript's path. Codeman installs those hooks in
+every Claude workspace unless `workspaceHooksEnabled` is off.
 
-The chat view also listens for events the server already broadcasts:
+Some sessions have no watcher: one the server picked up after a restart, one with
+hooks switched off, and a Docker case whose hooks cannot reach the server. For
+those, any full read of the conversation starts a watcher from the transcript that
+read found. A full read is `GET /api/sessions/:id/last-response?context=full`, which
+both the chat view and the Response Viewer's More button make. So these sessions
+also update mid-turn. After a `/clear`, a read moves a watcher it started itself to
+the conversation's new file, because no hook will move it. The read never replaces
+or moves a watcher a hook started, and it starts none for a remote session.
 
-- `transcript:tool_start` drives the status line. With parallel tool calls, the
-  matching `transcript:tool_end` fires once, so the status line shows the most
+The watcher emits `transcript:update` whenever new lines arrive. The server
+broadcasts it as an SSE event, throttled to one per 750 ms per session, so the
+browser learns of each new message while a turn is still running.
+
+The chat view also listens for these events:
+
+- `transcript:tool_start` drives the status line, because it carries the tool's
+  `detail` and, for a described Bash call, its `command`. With parallel tool calls,
+  the matching `transcript:tool_end` fires once, so the status line shows the most
   recent tool rather than counting calls.
 - `session:working` and `session:idle` mark the start and end of a turn. They come
   from Codeman's idle detection, not from hooks, so they also work where no
@@ -87,16 +116,18 @@ The chat view also listens for events the server already broadcasts:
 `transcript:complete` does not help here. It fires only for a `result` row, and an
 interactive Claude transcript has none.
 
-Where no watcher runs, the view refetches on `session:working` and `session:idle`
-alone and so updates only at the start and end of each turn. Hooks switched off
-leave no watcher. In a Docker case, the hook reports the transcript's path inside
-the container, which the host cannot open, so there is no watcher either.
+A Docker case whose hooks do reach the server is the exception. Its hook reports the
+transcript's path inside the container, which the host cannot open. The watcher
+keeps that path, so the full read starts no second one. Such a session refetches on
+`session:working` and `session:idle` alone, and so updates only at the start and end
+of each turn.
 
 ## How the user sends a prompt
 
 The message box is a multiline text area. On a desktop, Enter sends and
-Shift+Enter adds a line. On a touch device only the Send button sends, as in the
-phone's Compose dialog.
+Shift+Enter adds a line. On a touch device the Send button sends, and so does
+Ctrl+Enter or Cmd+Enter from a hardware keyboard. Plain Enter adds a line there, as
+in the phone's Compose dialog.
 
 A send posts the text and its Enter as one input to `POST /api/sessions/:id/input`
 with `useMux: true`. The server then pastes the text through tmux, presses Enter,
@@ -110,10 +141,13 @@ chat view does not use it for prompts, even though that channel queues input
 across a dropped connection.
 
 Each request carries a client id, made once per page load, and a sequence number.
-A request that fails on the network is retried with the same pair, so the server
-applies it once. A request the server refuses is not retried, and the text stays
-in the message box. The submit check cannot always recognise a multi-line prompt in
-the composer, so a long paste sent in those first seconds can still strand.
+A request that fails on the network, or that the server answers with a 5xx error,
+is retried with the same pair, so the server applies it once. A request the server
+refuses with a 4xx status is not retried, and the text stays in the message box.
+
+The submit check cannot always recognise a multi-line prompt in the composer. So a
+long paste sent in the 30 to 50 seconds after Claude's composer appears can still
+strand.
 
 Claude Code stores a pasted prompt inside a `<pasted_content>` tag, and every
 multi-line prompt sent through tmux is a paste. The chat view unwraps that tag
@@ -122,18 +156,68 @@ before rendering, or the markdown renderer would run the lines together.
 The box also gets these controls:
 
 - A stop button sends Esc, which interrupts the current turn.
-- An attach button and drag-and-drop reuse the existing prompt upload route. The
-  uploaded files' paths go into the chat message box, using the upload code's
-  existing option to return paths instead of typing them into the pane.
-- A slash command is sent as text. A command that opens a picker inside Claude's
-  interface, such as a bare `/model`, shows nothing in the chat view. The user
-  switches to the terminal to use the picker.
+- An attach button, drag-and-drop and pasting a screenshot or file into the message
+  box all reuse the existing prompt upload route. The uploaded files' paths go into
+  the chat message box, using the upload code's existing option to return paths
+  instead of typing them into the pane. A paste that carries no file the attach rules
+  admit stays a plain text paste.
+- A slash command is sent as text, and the conversation shows it as typed
+  (`/dual-review`), not as the tags Claude Code records it with. A skill's body,
+  which Claude Code adds as a hidden row, stays out. Claude Code records `/compact`
+  only when its turn ends, so the sent copy stays drawn while that turn runs. A
+  skill's row arrives as its turn starts, followed at once by the hidden body row,
+  and that row takes the sent copy's place then. A command that runs no turn and is
+  never recorded goes from the thread after four seconds.
+- Some slash commands typed with nothing after them get special handling in the chat view:
+  - `/quit` and `/exit` close the session at once, as the tab's close button does,
+    rather than waiting for the agent to exit and the server to notice.
+  - `/clear` empties the thread at once. Claude Code starts a new conversation file,
+    and its SessionStart hook (`conversation_cleared`) names it, so the server moves
+    to it before the next prompt. A session whose workspace lacks that hook, such as
+    one with workspace hooks turned off, moves with its next prompt, and until then
+    the chat view leaves out every message no newer than the newest one it drew
+    before `/clear`.
+  - A built-in that opens a picker or a panel inside Claude's interface, such as a
+    bare `/model` or `/config`, shows the terminal, with a note that Alt+Shift+C
+    goes back. The session's remembered choice of view does not change. The server
+    marks those commands (`opensTerminal` in the `/` menu's list).
 
 The terminal stays mounted and attached while Chat shows. The chat view is a layer
 over the terminal's area, so the terminal keeps its size and switching views never
 resizes the pane. The stop button uses the terminal's connection to send Esc. Any
 focus that lands on the hidden terminal moves to the message box, so keys never
 reach the pane unseen.
+
+## What else the message box shows
+
+The message box also carries three things the terminal shows around Claude's
+composer.
+
+- **A `/` menu.** Typing `/` at the start of the box opens a menu of slash commands,
+  fed by `GET /api/sessions/:id/slash-commands`. The list merges three sources:
+  Claude Code's built-in commands, the skills and prompt commands that the
+  transcript's `skill_listing` rows name, and the skills and commands on disk. The server reads those files from
+  the workspace's `.claude` folder and the user's Claude config folder, and every
+  read is bounded. For a Docker session it reads only the workspace's `.claude`
+  folder, because that session's config folder is the container's. Picking a row
+  puts `/<name> ` in the box and sends nothing.
+- **The statusline.** Claude Code draws the user's statusline under its composer,
+  and the chat view draws the same text under the message box. Codeman's statusline
+  exporter wraps the user's own statusline command. Its V5 script prints that
+  command's output unchanged and posts a base64 copy of it as `rendered`. The server
+  keeps only the text, line breaks and colours, and broadcasts each change as
+  `session:statusLine`. A user without a statusline of their own sees Codeman's footer.
+  Claude Code runs the statusline command again only on a session's next turn, so the
+  server restores the last text after a restart, and an idle session keeps its statusline.
+- **The suggested next prompt.** After a turn ends, Claude Code may draw a predicted
+  next prompt, faint, in its empty composer. It writes that prediction nowhere else,
+  so `src/web/prompt-suggestion-reader.ts` reads it off the pane three times, at
+  about 1.5, 4 and 10 seconds after the turn ends. It reads nothing while no browser
+  is connected to the server. The chat view shows it as the box's placeholder, and Tab in
+  the empty box fills it in. A suggestion is never sent without the user.
+  Each read is a synchronous tmux capture that blocks the server's event loop, and
+  so are the reads of the submit verifier, the idle probe and keep-warm. Moving every
+  one of those screen reads to an async capture is a follow-up.
 
 ## Dialogs and questions
 
@@ -143,31 +227,45 @@ but the dialog that answers it exists only in the pane.
 
 Codeman's Approvals Inbox already detects these through Claude's hooks, reads the
 options from the pane, and answers them with `POST /api/approvals/:id/answer`.
-Its store runs even while the inbox setting is off. The chat view shows a pending
-item for its session as a card at the bottom of the conversation, with one button
-per option. A click goes through the same answer route, which re-reads the pane
+Its store runs even while the inbox setting is off. In phase 2 the chat view shows a
+pending item for its session as a card at the bottom of the conversation, with one
+button per option. A click goes through the same answer route, which re-reads the pane
 before it types anything.
 
 The pane can also need attention in ways the inbox cannot parse. For those, the
-card says "Claude is waiting in the terminal" and offers a button that switches
+card says "Claude is waiting for your answer in the terminal." and offers a button that switches
 to the terminal view.
 
-Phase 1 shows that notice for every pending dialog, and the answer cards follow
-in phase 2. Dialogs are rare enough for this order. Codeman starts Claude with
-`--dangerously-skip-permissions` by default, so a session stops only for
+In phase 1, the `permission_prompt` and `elicitation_dialog` hooks raise that notice,
+and the answer cards follow in phase 2. While the notice shows, the message box sends
+nothing and keeps its text. A send then would type into the dialog, and its Enter could
+pick the highlighted option. A session without working hooks gets neither the notice
+nor the send block: its hooks are switched off, or it is a Docker case whose hooks
+cannot reach the server. A send there can still type into a dialog. Covering those
+sessions needs a read of the screen, because the Approvals Inbox behind the phase 2
+cards is fed by the same hooks. Dialogs are rare enough for this order. Codeman starts
+Claude with `--dangerously-skip-permissions` by default, so a session stops only for
 Claude's own questions and plan approvals. A session started in another
 permission mode stops for every permission prompt and sends each one to the
 terminal until phase 2.
 
 ## Scope
 
-The first version covers local Claude sessions in the single main view. Tiles in
-the tile grid and the second pane of a split stay terminals.
+The first version covers local and Docker Claude sessions in the single main view.
+Remote (SSH) and adopted sessions keep the terminal, even an adopted session that
+runs on this machine, because Codeman cannot name an adopted session's transcript.
+Tiles in the tile grid and the second pane of a split stay terminals. Phones keep
+the terminal until phase 3. The chat view is not offered on a handheld device, whatever
+its orientation, so a phone turned to landscape keeps the terminal too.
 
 Docker Claude sessions read their transcripts through the same route, because
 the container bind-mounts the host's `~/.claude/projects`. That works only when the
-folder existed when the container was created. They get no live updates mid-turn,
-as described under "How the view stays live".
+folder existed when the container was created. It also works only while the server
+runs without `CLAUDE_CONFIG_DIR`. With that variable set, the route reads
+`$CLAUDE_CONFIG_DIR/projects`, which the container does not mount. A Docker session
+whose hooks cannot reach the server updates mid-turn once a full read has started its
+watcher. That read comes from the chat view or the Response Viewer's More button, as
+described under "How the view stays live".
 
 Remote SSH sessions are not covered. The route reads the local projects folder,
 and a remote session's transcript lives on the remote host. The Edit history panel
@@ -175,21 +273,28 @@ already reads remote transcripts over its bounded ssh path, and phase 3 can reus
 it.
 
 Codex and DeepSeek Harness also write structured transcripts, which Codeman
-already reads, so they can follow in phase 3. The other CLIs keep the terminal view,
-and their toggle is hidden. Codeman reads their conversation off the screen, which
-is too coarse for a main view, or cannot read it at all.
+already reads, so they can follow in phase 3. OMP writes a structured transcript as
+well, and Codeman reads it for the session history list. The conversation route has
+no OMP reader yet, so OMP can follow once that route reads its transcript. Every
+other CLI keeps the terminal view for now, and its toggle is hidden. For the CLIs without a structured transcript, Codeman reads the conversation
+off the screen, which is too coarse for a main view, or cannot read it at all.
 
-Nothing changes for the agent itself. The tmux session, respawn, Ralph, hooks,
-auto-compact and every other server feature work exactly as they do now.
+The agent keeps running in its tmux pane, and respawn, Ralph, auto-compact and the
+other server features work as they do now. The hooks block Codeman installs in every
+Claude workspace gains three silent hooks, whether or not the chat view is on:
+SessionStart with the `clear` matcher, PreCompact and PostCompact. They only report to
+the server, and none of them changes what the agent does.
 
 ## Phases
 
-1. **Live chat view.** Add the Chat/Terminal toggle and the default-view setting.
+1. **Live chat view.** Add the Chat/Terminal toggle, the setting that hides it and
+   the default-view setting.
    Broadcast transcript updates as a throttled SSE event. Render the full
    conversation with the Response Viewer's pipeline, refetch it on transcript and
    session events, and show the working status line. Add the message box with
-   send, stop and attach. When Claude waits on a dialog, show the "waiting in the
-   terminal" notice with its switch button.
+   send, stop and attach. When Claude waits on a dialog, show the "waiting for
+   your answer in the terminal" notice with its switch button. Add the `/` menu, the statusline under
+   the message box and the suggested next prompt as its placeholder.
 2. **Dialogs and tool activity.** Show approval cards inline. Extend the transcript
    parser with tool messages and render each turn's calls as one expandable
    summary line.

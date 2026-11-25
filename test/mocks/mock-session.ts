@@ -145,6 +145,14 @@ export class MockSession extends EventEmitter {
     this.lastSubmitAt = Date.now();
   }
 
+  /** Mirrors Session.compacting / setCompacting. */
+  compacting = false;
+  setCompacting(on: boolean): boolean {
+    if (on === this.compacting) return false;
+    this.compacting = on;
+    return true;
+  }
+
   /** Mirrors Session.trackUserInput (the send-key route feeds it around the write path). */
   trackUserInput(_data: string): void {}
 

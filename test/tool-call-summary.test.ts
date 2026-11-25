@@ -5,7 +5,12 @@
  * Port: none.
  */
 import { describe, expect, it } from 'vitest';
-import { summarizeToolCall, toolCallCommand, TOOL_DETAIL_MAX_CHARS } from '../src/tool-call-summary.js';
+import {
+  summarizeToolCall,
+  toolCallCommand,
+  toolStartPayload,
+  TOOL_DETAIL_MAX_CHARS,
+} from '../src/tool-call-summary.js';
 
 describe('summarizeToolCall', () => {
   it('names the file, the command, the pattern or the page', () => {
@@ -51,5 +56,33 @@ describe('summarizeToolCall', () => {
     const out = summarizeToolCall('Bash', { command: 'x'.repeat(1000) })!;
     expect(out).toHaveLength(TOOL_DETAIL_MAX_CHARS + 1);
     expect(out.endsWith('…')).toBe(true);
+  });
+});
+
+describe('toolStartPayload', () => {
+  it('carries the detail of a Read', () => {
+    expect(toolStartPayload('s1', 'Read', { file_path: '/w/a.ts' }, 1000)).toEqual({
+      sessionId: 's1',
+      toolName: 'Read',
+      detail: '/w/a.ts',
+      timestamp: 1000,
+    });
+  });
+
+  it('carries the description and the command of a Bash call', () => {
+    expect(toolStartPayload('s1', 'Bash', { command: 'npm test', description: 'Run the tests' }, 1000)).toEqual({
+      sessionId: 's1',
+      toolName: 'Bash',
+      detail: 'Run the tests',
+      command: 'npm test',
+      timestamp: 1000,
+    });
+  });
+
+  it('leaves both fields out for a call with no input', () => {
+    const payload = toolStartPayload('s1', 'TodoWrite', undefined, 1000);
+    expect(payload).toEqual({ sessionId: 's1', toolName: 'TodoWrite', timestamp: 1000 });
+    expect('detail' in payload).toBe(false);
+    expect('command' in payload).toBe(false);
   });
 });

@@ -19618,6 +19618,15 @@ html[data-session-list="sidebar"][data-sidebar="collapsed"] .btn-sidebar-toggle 
   top: 28px;
 }
 
+/* Pane A's split header is the first child of .terminal-wrap, so the chat layer and its switch start below it. */
+.terminal-pane-a-header ~ .chat-view {
+  top: 28px;
+}
+
+.terminal-pane-a-header ~ .chat-view-toggle {
+  top: 36px;
+}
+
 .split-harness.run-mode-dot {
   font-size: 13px;
 }
@@ -24067,6 +24076,13 @@ body.keyboard-visible .terminal-container .xterm-screen {
   padding-top: 15vh;
 }
 
+/* The notice is a paragraph directly inside the scroller, which carries the Response Viewer's
+   `.response-viewer-body > p` margin rule; this one outranks it so the notice stays centred. */
+.chat-view-scroll > .chat-view-empty {
+  margin-left: auto;
+  margin-right: auto;
+}
+
 .chat-view-show-all {
   margin-top: 8px;
   padding: 0;
@@ -24395,6 +24411,18 @@ html:is([data-skin="paper-gray"], [data-skin="solarized-light"], [data-skin="cat
   background: rgba(var(--accent-rgb), 0.16);
   color: var(--text);
   font-weight: 600;
+}
+
+/* The partial-history banner draws its Load full history and dismiss buttons at
+   the right end of the top row, where the Chat / Terminal switch sits. */
+.terminal-wrap:has(> .chat-view-toggle:not([hidden])) .history-trunc-bar {
+  padding-inline-end: 170px;
+}
+
+/* The keyboard accessory bar's keys write straight into the pane, which the chat
+   view hides, so the bar stays hidden while the chat view shows. */
+body.chat-view-showing .keyboard-accessory-bar.visible {
+  display: none;
 }
 
 @media (prefers-reduced-motion: reduce) {

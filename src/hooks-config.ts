@@ -16,9 +16,11 @@
  *
  * Hook events generated: `idle_prompt`, `permission_prompt`, `elicitation_dialog`,
  * `elicitation_complete`, `elicitation_response`, `stop`, `teammate_idle`,
- * `task_completed`
+ * `task_completed`, `prompt_submitted`, `conversation_cleared`, `compact_started`,
+ * `compact_finished`
  *
- * Hook categories: `Notification` (5 matchers), `Stop` (1), `SubagentStop` (1),
+ * Hook categories: `Notification` (5 matchers), `Stop` (1), `UserPromptSubmit` (1),
+ * `SessionStart` (1, `clear`), `PreCompact` (1), `PostCompact` (1), `SubagentStop` (1),
  * `TeammateIdle` (1), `TaskCompleted` (1), `PostToolUse` (1 self-contained
  * background Bash rewake)
  *
@@ -482,6 +484,30 @@ export function generateHooksConfig(): { hooks: Record<string, unknown[]> } {
           hooks: [{ type: 'command', command: curlCmdSilent('prompt_submitted'), timeout: HOOK_TIMEOUT_SECONDS }],
         },
       ],
+      // `/clear` opens a new conversation file. Its SessionStart hook names it at once, so the
+      // chat view and the response viewer move to it before the next prompt. Silent for the
+      // same reason as UserPromptSubmit: a SessionStart hook's stdout becomes context for Claude.
+      SessionStart: [
+        {
+          matcher: 'clear',
+          hooks: [{ type: 'command', command: curlCmdSilent('conversation_cleared'), timeout: HOOK_TIMEOUT_SECONDS }],
+        },
+      ],
+      // Compaction runs for a minute or more and writes nothing to the transcript until it ends,
+      // so these two are what lets the chat view say "Compacting conversation" meanwhile. Both
+      // fire for `/compact` and for Claude Code's own auto-compaction. Silent: a PreCompact
+      // hook's output must not reach the compaction, and `|| true` keeps the exit code 0
+      // (exit 2 would block it).
+      PreCompact: [
+        {
+          hooks: [{ type: 'command', command: curlCmdSilent('compact_started'), timeout: HOOK_TIMEOUT_SECONDS }],
+        },
+      ],
+      PostCompact: [
+        {
+          hooks: [{ type: 'command', command: curlCmdSilent('compact_finished'), timeout: HOOK_TIMEOUT_SECONDS }],
+        },
+      ],
       SubagentStop: [
         {
           hooks: [
@@ -784,6 +810,10 @@ export async function refreshStaleCodemanHooks(casePath: string): Promise<void> 
     // workspace's settings file on every Claude spawn. The sibling markers are
     // quote-free for the same reason.
     const hasPromptSubmit = hooksJson.includes('prompt_submitted');
+    // The SessionStart `clear` hook tells Codeman the new conversation right after `/clear`.
+    const hasConversationCleared = hooksJson.includes('conversation_cleared');
+    // PreCompact and PostCompact tell Codeman a compaction is running.
+    const hasCompactHooks = hooksJson.includes('compact_started') && hooksJson.includes('compact_finished');
     if (
       !isOurs ||
       (hasSecret &&
@@ -791,6 +821,8 @@ export async function refreshStaleCodemanHooks(casePath: string): Promise<void> 
         hasSubagentStopGuard &&
         hasElicitationComplete &&
         hasPromptSubmit &&
+        hasConversationCleared &&
+        hasCompactHooks &&
         !hasTlsFlaglessCurl)
     )
       return;

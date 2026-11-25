@@ -292,6 +292,7 @@ const _SSE_HANDLER_MAP = [
   // Chat view (chat-view.js): re-read the conversation as the transcript grows, and name the
   // running tool. Turn starts and ends reach it from _onSessionWorking / _onSessionIdle.
   [SSE_EVENTS.TRANSCRIPT_UPDATE, '_onChatViewTranscriptUpdate'],
+  [SSE_EVENTS.HOOK_CONVERSATION_CLEARED, '_onChatViewConversationCleared'],
   [SSE_EVENTS.TRANSCRIPT_TOOL_START, '_onChatViewToolStart'],
   [SSE_EVENTS.SESSION_STATUS_LINE, '_onChatViewStatusLine'],
 
@@ -1462,6 +1463,11 @@ class CodemanApp {
         // phase, before the box's own onkeydown, so the box cannot claim it there.
         if (e.target?.id === 'tabRailSearch' && this._tabRailSearch) {
           this.handleTabRailSearchKeydown(e);
+          return;
+        }
+        // The chat view's `/` menu: Escape closes the menu alone (chat-view.js).
+        if (e.target?.classList?.contains('chat-view-input') && this._chatView?.slash) {
+          this._chatViewSlashClose();
           return;
         }
         // The local model window can sit on top of App Settings (it opens from a
@@ -3677,7 +3683,7 @@ class CodemanApp {
     // An open Edit history panel re-reads at the end of its session's turn (edit-history-ui.js),
     // not after Codeman's own keep-alive turn, which edits nothing.
     if (!data.keepAlive) this.onEditHistorySessionIdle?.(data.id);
-    this.onChatViewTurnEvent?.(data.id, true);
+    this.onChatViewTurnEvent?.(data.id, true, data.keepAlive);
     // Start stuck detection timer (only if no respawn running). Not at the end of Codeman's
     // own keep-alive turn (`keepAlive`): the session has been waiting since the last real
     // turn, whose timer is still running or has already fired.
@@ -3703,7 +3709,7 @@ class CodemanApp {
       this.sendPendingCtrlL(data.id);
       if (data.id === this.activeSessionId) this._updateLocalEchoState();
     }
-    this.onChatViewTurnEvent?.(data.id, false);
+    this.onChatViewTurnEvent?.(data.id, false, data.keepAlive);
     // Clear stuck detection timer, unless this is Codeman's own keep-alive turn, which is
     // no sign of life from the agent's side.
     const timer = data.keepAlive ? null : this.idleTimers.get(data.id);

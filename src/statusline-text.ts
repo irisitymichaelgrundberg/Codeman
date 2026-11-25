@@ -16,7 +16,7 @@
  * output, and the browser sets it with `textContent` only.
  */
 
-import { ANSI_ESCAPE_PATTERN_FULL } from './utils/regex-patterns.js';
+import { ANSI_ESCAPE_PATTERN_FULL } from './utils/index.js';
 
 export const STATUSLINE_MAX_LINES = 4;
 /** Per line, counting the SGR sequences too, so a line cannot carry unbounded escapes. */
@@ -32,6 +32,9 @@ const ALL_SGR = /\x1b\[[0-9;]*m/g;
 const LONE_ESC = /\x1b(?!\[[0-9;]*m)/g;
 // eslint-disable-next-line no-control-regex
 const OTHER_CONTROLS = /[\u0000-\u0009\u000b-\u001a\u001c-\u001f\u007f]/g;
+/** An SGR sequence the line cap cut in half, left at the end of the line. */
+// eslint-disable-next-line no-control-regex
+const CUT_ESCAPE = /\x1b(?:\[[0-9;]*)?$/;
 
 /** Keep text, line breaks and colour; drop every other escape and control character. */
 export function sanitizeStatusLineText(raw: string): string {
@@ -41,7 +44,9 @@ export function sanitizeStatusLineText(raw: string): string {
     .replace(new RegExp(ANSI_ESCAPE_PATTERN_FULL.source, 'g'), (seq) => (SGR.test(seq) ? seq : ''))
     .replace(LONE_ESC, '')
     .replace(OTHER_CONTROLS, '');
-  const lines = text.split('\n').map((line) => line.trimEnd().slice(0, STATUSLINE_MAX_LINE_CHARS));
+  const lines = text
+    .split('\n')
+    .map((line) => line.trimEnd().slice(0, STATUSLINE_MAX_LINE_CHARS).replace(CUT_ESCAPE, ''));
   while (lines.length > 0 && lines[lines.length - 1].replace(ALL_SGR, '').trim() === '') lines.pop();
   return lines.slice(0, STATUSLINE_MAX_LINES).join('\n');
 }

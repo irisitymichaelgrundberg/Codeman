@@ -9,13 +9,20 @@
  * Port: N/A
  */
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { registerSessionRoutes } from '../../src/web/routes/session-routes.js';
 import { createMockRouteContext, type MockRouteContext } from '../mocks/index.js';
+import { readSlashCommandFiles } from '../../src/claude-slash-command-files.js';
+
+// The real reader, wrapped so a test can tell whether the route reached it.
+vi.mock('../../src/claude-slash-command-files.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/claude-slash-command-files.js')>();
+  return { ...actual, readSlashCommandFiles: vi.fn(actual.readSlashCommandFiles) };
+});
 
 const listing = (names: string[], content: string, isInitial = true) =>
   JSON.stringify({ type: 'attachment', attachment: { type: 'skill_listing', names, content, isInitial } });
@@ -28,6 +35,7 @@ describe('GET /api/sessions/:id/slash-commands', () => {
   let previousHome: string | undefined;
 
   beforeEach(async () => {
+    vi.mocked(readSlashCommandFiles).mockClear();
     home = mkdtempSync(join(tmpdir(), 'codeman-slash-'));
     workspace = join(home, 'project');
     mkdirSync(workspace, { recursive: true });
@@ -92,15 +100,56 @@ describe('GET /api/sessions/:id/slash-commands', () => {
     expect(list.map((c) => c.name)).toEqual([...list.map((c) => c.name)].sort((a, b) => a.localeCompare(b)));
   });
 
+  it("finds a Docker session's transcript on the host, never at the container path its hook reports", async () => {
+    write(
+      join(home, '.claude', 'projects', '-project', 'conv-1.jsonl'),
+      listing(['docker-skill'], '- docker-skill: Listed in the container')
+    );
+    (ctx._session as unknown as { docker: unknown }).docker = { containerName: 'codeman-case-x' };
+    vi.mocked(ctx.getTranscriptPath).mockReturnValue('/home/agent/.claude/projects/-project/conv-1.jsonl');
+
+    const byName = new Map((await commands()).map((c) => [c.name, c]));
+    expect(byName.get('docker-skill')?.description).toBe('Listed in the container');
+  });
+
   it('offers the files and built-ins to a session that has no transcript yet', async () => {
     write(join(workspace, '.claude', 'skills', 'local', 'SKILL.md'), '---\ndescription: >\n  Folded\n  text\n---\n');
     const names = (await commands()).map((c) => c.name);
     expect(names).toContain('local');
     expect(names).toContain('clear');
+    // The two refusal tests below lean on this wrapper seeing the route's call.
+    expect(readSlashCommandFiles).toHaveBeenCalled();
+  });
+
+  it("confines the workspace's files to the workspace, so a link out of it lists nothing", async () => {
+    write(join(home, 'secret.md'), 'SECRET-LINE of a private file\n');
+    mkdirSync(join(workspace, '.claude', 'commands'), { recursive: true });
+    symlinkSync(join(home, 'secret.md'), join(workspace, '.claude', 'commands', 'leak.md'));
+
+    const list = await commands();
+    expect(list.map((c) => c.name)).not.toContain('leak');
+    expect(list.some((c) => c.description.includes('SECRET-LINE'))).toBe(false);
+    const roots = vi.mocked(readSlashCommandFiles).mock.calls[0][0];
+    const workspaceRoot = roots.find((r) => r.dir === join(workspace, '.claude'));
+    expect(workspaceRoot?.confineTo).toBe(realpathSync(workspace));
   });
 
   it('answers an empty list for a CLI without a Claude transcript', async () => {
     ctx._session.mode = 'codex';
     expect(await commands()).toEqual([]);
+  });
+
+  it('answers an empty list for a remote session without reading any file', async () => {
+    write(join(workspace, '.claude', 'skills', 'local', 'SKILL.md'), '---\ndescription: Local\n---\n');
+    (ctx._session as unknown as { remote: unknown }).remote = { hostId: 'h1', remoteWorkingDir: workspace };
+    expect(await commands()).toEqual([]);
+    expect(readSlashCommandFiles).not.toHaveBeenCalled();
+  });
+
+  it('answers an empty list for an adopted session without reading any file', async () => {
+    write(join(workspace, '.claude', 'skills', 'local', 'SKILL.md'), '---\ndescription: Local\n---\n');
+    (ctx._session as unknown as { isAdopted: boolean }).isAdopted = true;
+    expect(await commands()).toEqual([]);
+    expect(readSlashCommandFiles).not.toHaveBeenCalled();
   });
 });

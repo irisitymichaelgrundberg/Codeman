@@ -1,5 +1,6 @@
 /**
- * @fileoverview Collapse a prompt onto the one line an unattended sender writes.
+ * @fileoverview Collapse text onto one line: a prompt an unattended sender writes
+ * ({@link toSingleLine}), or untrusted text a status or menu shows as one line ({@link oneLineText}).
  *
  * @module utils/single-line
  */
@@ -26,4 +27,19 @@ export function toSingleLine(prompt: string): string {
     .map((line) => line.trim())
     .filter(Boolean)
     .join(' ');
+}
+
+/** Control characters, line breaks included. */
+// eslint-disable-next-line no-control-regex
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]+/g;
+
+/**
+ * Untrusted text as one short line: C0 control characters and DEL become spaces, runs of
+ * whitespace collapse to one space, the ends are trimmed, and the result is cut at `max`
+ * UTF-16 code units. A cut line ends in `…` unless `ellipsis` is false.
+ */
+export function oneLineText(value: string, max: number, ellipsis = true): string {
+  const flat = value.replace(CONTROL_CHARS, ' ').replace(/\s+/g, ' ').trim();
+  if (flat.length <= max) return flat;
+  return ellipsis ? `${flat.slice(0, max)}…` : flat.slice(0, max);
 }

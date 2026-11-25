@@ -83,7 +83,7 @@ import { attachmentRegistry, buildFileThumbnailRoute, registerExternalAttachment
 import { folderAllowedForUser, folderGrants } from '../folder-listing.js';
 import { isOutsideWorktreeRootRefused, loadAttachmentGuardConfig } from '../config/attachment-guard.js';
 import { getCli, enabledClis, listClis } from '../config/cli-registry/registry.js';
-import { summarizeToolCall, toolCallCommand } from '../tool-call-summary.js';
+import { toolStartPayload } from '../tool-call-summary.js';
 import { isCliEntryInstalled, probeStockCliAvailability } from '../utils/cli-installed-probes.js';
 import { readCustomModelHosts, resolveCustomModelContextLength } from '../custom-model-hosts.js';
 import {
@@ -135,7 +135,7 @@ import { agentInboxPersistence } from './agent-inbox-persistence.js';
 import { AI_CHECK_MODEL } from '../config/ai-defaults.js';
 import { approvalInbox } from './approval-inbox.js';
 import { SCREEN_BLOCKED_SOURCE } from './screen-blocked.js';
-import { PromptSuggestionReader } from './prompt-suggestion-reader.js';
+import { PromptSuggestionReader, readPromptSuggestionFrame } from './prompt-suggestion-reader.js';
 import { PromptCacheKeepWarmService } from '../prompt-cache-keepwarm.js';
 import { fetchWorkspaceOnce } from '../git-fetch.js';
 import { GitFetchScheduler } from '../git-fetch-scheduler.js';
@@ -189,6 +189,7 @@ import {
 import {
   CleanupManager,
   KeyedDebouncer,
+  KeyedThrottle,
   StaleExpirationMap,
   startEventLoopMonitor,
   isSafePushEndpoint,
@@ -441,7 +442,7 @@ export class WebServer extends EventEmitter {
    * TRANSCRIPT_UPDATE_THROTTLE_MS. A busy turn writes several lines a second, and every SSE
    * client gets every broadcast.
    */
-  private transcriptUpdateThrottle: Map<string, { lastAt: number; timer: NodeJS.Timeout | null }> = new Map();
+  private readonly transcriptUpdateThrottle = new KeyedThrottle(TRANSCRIPT_UPDATE_THROTTLE_MS);
   // Store session listener references for explicit cleanup (prevents memory leaks)
   private sessionListenerRefs: Map<string, SessionListenerRefs> = new Map();
   private scheduledRuns: Map<string, ScheduledRun> = new Map();
@@ -449,22 +450,19 @@ export class WebServer extends EventEmitter {
   private _customModelDisplacedNotified: Set<string> = new Set();
   /** Cron service (assigned in setupRoutes). */
   private cronService!: CronService;
-  // Prompt-cache keep-warm (prompt-cache-keepwarm.ts): the rulebook and timers live in the
-  // service; the server only lends it the facts a decision needs. A field initializer, not a
-  // setupRoutes() step: cleanup and listener wiring reach it on servers that never set up routes
-  // (the pane-exit and discard tests build a bare WebServer), and every port reads `this.*` lazily.
   // Claude Code's suggested next prompt, read off the pane after a turn ends, for the chat view
   // (prompt-suggestion-reader.ts). Only sessions the chat view can show are read: a Claude-format
-  // transcript, a local pane, not adopted.
+  // transcript, a local pane, not adopted. Nothing is read while no browser holds an SSE
+  // connection, because each capture is synchronous and nobody would see the suggestion.
   private readonly promptSuggestionReader = new PromptSuggestionReader({
     read: (id) => {
       const session = this.sessions.get(id);
-      const cli = session ? getCli(session.mode) : undefined;
-      const glyph = cli?.capabilities.workDetect?.promptGlyph;
-      if (!session || cli?.capabilities.transcript !== 'claude-jsonl' || !glyph) return null;
-      if (session.remote || session.isAdopted || !session.muxName) return null;
-      const screen = this.mux.capturePaneText?.(session.muxName, undefined, { styles: true }) ?? null;
-      return screen ? { screen, glyph } : null;
+      return readPromptSuggestionFrame(
+        session,
+        session ? getCli(session.mode) : undefined,
+        (muxName, opts) => this.mux.capturePaneText?.(muxName, undefined, opts) ?? null,
+        this.sse.clientCount
+      );
     },
     isIdle: (id) => this.sessions.get(id)?.status === 'idle',
     publish: (id, text) => {
@@ -472,6 +470,10 @@ export class WebServer extends EventEmitter {
     },
   });
 
+  // Prompt-cache keep-warm (prompt-cache-keepwarm.ts): the rulebook and timers live in the
+  // service; the server only lends it the facts a decision needs. A field initializer, not a
+  // setupRoutes() step: cleanup and listener wiring reach it on servers that never set up routes
+  // (the pane-exit and discard tests build a bare WebServer), and every port reads `this.*` lazily.
   private readonly keepWarmService = new PromptCacheKeepWarmService({
     getSession: (id) => this.sessions.get(id),
     sessionIds: () => this.sessions.keys(),
@@ -1531,18 +1533,7 @@ export class WebServer extends EventEmitter {
       });
 
       watcher.on('transcript:tool_start', (toolName: string, input?: unknown) => {
-        // `detail` names what the call works on (the file, the command), for the chat view's
-        // status line; absent when the input names nothing worth showing.
-        const detail = summarizeToolCall(toolName, input);
-        // A Bash call with a description also sends its command, shown under it as the CLI does.
-        const command = toolCallCommand(toolName, input);
-        this.broadcast(SseEvent.TranscriptToolStart, {
-          sessionId,
-          toolName,
-          ...(detail ? { detail } : {}),
-          ...(command ? { command } : {}),
-          timestamp: Date.now(),
-        });
+        this.broadcast(SseEvent.TranscriptToolStart, toolStartPayload(sessionId, toolName, input, Date.now()));
       });
 
       watcher.on('transcript:update', () => {
@@ -1596,37 +1587,16 @@ export class WebServer extends EventEmitter {
 
   /** Broadcast `transcript:update` for a session, throttled (see `transcriptUpdateThrottle`). */
   private broadcastTranscriptUpdate(sessionId: string): void {
-    const state = this.transcriptUpdateThrottle.get(sessionId) ?? { lastAt: 0, timer: null };
-    this.transcriptUpdateThrottle.set(sessionId, state);
-    if (state.timer) return; // a trailing broadcast is already scheduled and will cover this one
-    const send = (): void => {
-      state.lastAt = Date.now();
-      this.broadcast(SseEvent.TranscriptUpdate, { sessionId, timestamp: state.lastAt });
-    };
-    const wait = state.lastAt + TRANSCRIPT_UPDATE_THROTTLE_MS - Date.now();
-    if (wait <= 0) {
-      send();
-      return;
-    }
-    state.timer = setTimeout(() => {
-      state.timer = null;
-      send();
-    }, wait);
-    state.timer.unref?.();
-  }
-
-  /** Drop a session's pending `transcript:update` broadcast. */
-  private clearTranscriptUpdateThrottle(sessionId: string): void {
-    const state = this.transcriptUpdateThrottle.get(sessionId);
-    if (state?.timer) clearTimeout(state.timer);
-    this.transcriptUpdateThrottle.delete(sessionId);
+    this.transcriptUpdateThrottle.fire(sessionId, () => {
+      this.broadcast(SseEvent.TranscriptUpdate, { sessionId, timestamp: Date.now() });
+    });
   }
 
   /**
    * Stop the transcript watcher for a session.
    */
   private stopTranscriptWatcher(sessionId: string): void {
-    this.clearTranscriptUpdateThrottle(sessionId);
+    this.transcriptUpdateThrottle.cancelKey(sessionId);
     const watcher = this.transcriptWatchers.get(sessionId);
     if (watcher) {
       watcher.removeAllListeners(); // Prevent memory leaks from attached listeners
@@ -2236,9 +2206,6 @@ export class WebServer extends EventEmitter {
       '</head>',
       () => `<script>window.__codemanTranscriptPageKeys=${JSON.stringify(pageKeyClis)};</script>\n</head>`
     );
-    // Which run modes keep their PTY rows under a phone keyboard (inline renderers,
-    // the `keyboardHold` capability; `_keyboardHoldEligible` in terminal-ui.js). Same
-    // shape and reasoning as the page-key list above.
     // Which run modes the chat view can show (chat-view.js): the CLIs whose conversation Codeman
     // reads from a Claude-format transcript, read off the `transcript` capability, never an id
     // list here. Disabled entries are kept (`listClis`), like the wheel map below: disabling a CLI
@@ -2250,6 +2217,9 @@ export class WebServer extends EventEmitter {
       '</head>',
       () => `<script>window.__codemanChatViewModes=${JSON.stringify(chatViewClis)};</script>\n</head>`
     );
+    // Which run modes keep their PTY rows under a phone keyboard (inline renderers,
+    // the `keyboardHold` capability; `_keyboardHoldEligible` in terminal-ui.js). Same
+    // shape and reasoning as the page-key list above.
     const keyboardHoldClis = enabledClis()
       .filter((entry) => entry.capabilities.keyboardHold === 'inline')
       .map((entry) => entry.id);
@@ -4363,6 +4333,9 @@ export class WebServer extends EventEmitter {
               // Session Options readout would read "not reported yet" after every restart. The
               // readout is time-aware, so a value past its expiry shows as cold, not stale-warm.
               promptCache: savedState?.promptCache,
+              // The last statusline text, restored for the same reason, so the chat view
+              // shows it until the session's next turn sends a fresh one.
+              statusLine: savedState?.statusLine,
               // A record rebuilt from the socket has no provenance, so its
               // apparent locality is a guess (see `MuxSession.discovered`).
               discoveredMuxSession: muxSession.discovered,
@@ -4959,7 +4932,7 @@ export class WebServer extends EventEmitter {
     this.respawnTimers.clear();
     this.runSummaryTrackers.clear();
     this.transcriptWatchers.clear();
-    for (const sessionId of [...this.transcriptUpdateThrottle.keys()]) this.clearTranscriptUpdateThrottle(sessionId);
+    this.transcriptUpdateThrottle.dispose();
     await this.editHistorySync.flushAll().catch((err) => {
       console.warn('[EditHistory] Saving on shutdown failed:', getErrorMessage(err));
     });

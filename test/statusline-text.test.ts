@@ -33,6 +33,17 @@ describe('sanitizeStatusLineText', () => {
     expect(sanitizeStatusLineText(many).split('\n')).toHaveLength(STATUSLINE_MAX_LINES);
     expect(sanitizeStatusLineText('x'.repeat(5000))).toHaveLength(STATUSLINE_MAX_LINE_CHARS);
   });
+
+  it('drops an SGR sequence the line cap cut in half', () => {
+    const cutInSgr = sanitizeStatusLineText(`${'a'.repeat(595)}\u001b[38;5;208mX`);
+    expect(cutInSgr).not.toContain('\u001b');
+    expect(cutInSgr).not.toContain('[38;5');
+    expect(cutInSgr).toBe('a'.repeat(595));
+
+    const cutAfterEsc = sanitizeStatusLineText(`${'a'.repeat(STATUSLINE_MAX_LINE_CHARS - 1)}\u001b[0mX`);
+    expect(cutAfterEsc).not.toContain('\u001b');
+    expect(cutAfterEsc).toBe('a'.repeat(STATUSLINE_MAX_LINE_CHARS - 1));
+  });
 });
 
 describe('decodeRenderedStatusLine', () => {

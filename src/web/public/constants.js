@@ -1625,18 +1625,23 @@ const CHAT_TOOL_VERBS = {
  * on (`detail`, from the server's `transcript:tool_start`), with a path inside the session's
  * folder shown relative to it. A Bash call with a description (`command` set) shows the
  * description alone. "Working" before the first tool call of a turn.
+ *
+ * `t` translates the line's fixed English parts. A verb with an object goes through it as a
+ * template with a `{what}` slot, so the agent's text never passes through the translator. A
+ * described command and an unknown tool's name are the agent's own text and stay as they are.
  */
-function chatViewActivity(toolName, detail, workingDir, command) {
-  if (!toolName) return 'Working';
+function chatViewActivity(toolName, detail, workingDir, command, t = (text) => text) {
+  if (!toolName) return t('Working');
   // A described command: the description is the headline, as in the CLI (the command goes on
   // the line under it).
   if (command && typeof detail === 'string' && detail) return detail;
-  if (toolName === 'TodoWrite') return 'Updating the to-do list';
+  if (toolName === 'TodoWrite') return t('Updating the to-do list');
   let what = typeof detail === 'string' ? detail : '';
   const base = typeof workingDir === 'string' ? workingDir.replace(/\/+$/, '') : '';
   if (base && what.startsWith(`${base}/`)) what = what.slice(base.length + 1);
   const verb = CHAT_TOOL_VERBS[toolName];
-  if (verb) return what ? `${verb} ${what}` : verb.replace(/:$/, '');
+  // A function replacement, so a `$` in a path stays literal.
+  if (verb) return what ? t(`${verb} {what}`).replace('{what}', () => what) : t(verb.replace(/:$/, ''));
   return what ? `${toolName}: ${what}` : toolName;
 }
 
@@ -1747,6 +1752,22 @@ function chatViewSendPayload(value) {
     .replace(/\s+$/, '');
   if (text.trim() === '') return null;
   return `${text}\r`;
+}
+
+/**
+ * What a message box value asks of the chat view beyond sending it, when it is a slash command
+ * with nothing after it: `close` for `/quit` and `/exit` (the chat view closes the session
+ * itself, as the tab's close button does), `clear` for `/clear` (the thread empties at once),
+ * and `bare` with the command's name for any other one (which may open a picker in the
+ * terminal). Null for anything else, a command with arguments included.
+ */
+function chatViewSlashIntent(value) {
+  const match = /^\/([A-Za-z0-9][A-Za-z0-9._:-]*)$/.exec(String(value ?? '').trim());
+  if (!match) return null;
+  const name = match[1];
+  if (name === 'quit' || name === 'exit') return { kind: 'close', name };
+  if (name === 'clear') return { kind: 'clear', name };
+  return { kind: 'bare', name };
 }
 
 /** Most rows the `/` menu shows at once. */
@@ -1878,6 +1899,7 @@ if (typeof window !== 'undefined') {
     sendPayload: chatViewSendPayload,
     slashQuery: chatViewSlashQuery,
     slashMatches: chatViewSlashMatches,
+    slashIntent: chatViewSlashIntent,
   };
   window.CodemanInputLimit = {
     FRAME_MAX_CHARS: INPUT_FRAME_MAX_CHARS,
@@ -2145,6 +2167,9 @@ const SSE_EVENTS = {
   HOOK_TEAMMATE_IDLE: 'hook:teammate_idle',
   HOOK_TASK_COMPLETED: 'hook:task_completed',
   HOOK_PROMPT_SUBMITTED: 'hook:prompt_submitted',
+  HOOK_CONVERSATION_CLEARED: 'hook:conversation_cleared',
+  HOOK_COMPACT_STARTED: 'hook:compact_started',
+  HOOK_COMPACT_FINISHED: 'hook:compact_finished',
 
   // Approvals Inbox
   APPROVAL_PENDING: 'approval:pending',
