@@ -18,11 +18,19 @@
  * the state for that one answer, and parsed for good once its newline arrives, so the answer
  * always equals a parse of the whole file.
  *
- * @dependency prompt-cache-keepwarm.ts (KEEP_WARM_NUDGE), utils/lru-map.ts
+ * @dependency prompt-cache-keepwarm.ts (KEEP_WARM_NUDGE), claude-slash-commands.ts (typed commands,
+ *   skill listings), utils/lru-map.ts
  */
 
 import fs from 'node:fs/promises';
 import { KEEP_WARM_NUDGE } from '../prompt-cache-keepwarm.js';
+import {
+  noteSkillListing,
+  shellCommandOutput,
+  typedShellCommand,
+  typedSlashCommand,
+} from '../claude-slash-commands.js';
+import type { SlashCommand } from '../types.js';
 import { LRUMap } from '../utils/lru-map.js';
 
 export interface ClaudeResponseMessage {
@@ -38,13 +46,19 @@ export interface ClaudeResponseMessage {
    * and the reply is its "ok". The chat view leaves such turns out, as Read My Mind does.
    */
   keepAlive?: boolean;
+  /** The output of a `!` command the user ran, as a fenced code block. Claude wrote none of it. */
+  shellOutput?: boolean;
 }
 
-/** The last assistant text of a transcript and every message, as the route answers them. */
+/**
+ * The last assistant text of a transcript and every message, as the route answers them, and the
+ * skills its `skill_listing` rows name, which the chat view's `/` menu offers.
+ */
 export interface ClaudeResponseTranscript {
   text: string;
   timestamp: string;
   messages: ClaudeResponseMessage[];
+  skills: SlashCommand[];
 }
 
 interface ClaudeTranscriptEntry {
@@ -119,6 +133,8 @@ export class ClaudeResponseParser {
   private turn = 0;
   // Whether the current turn opened with Codeman's keep-warm nudge.
   private keepAliveTurn = false;
+  // The skills the `skill_listing` rows name so far, in listing order.
+  private skills = new Map<string, SlashCommand>();
 
   /** A parser in the same state, for parsing a line that may not be finished yet. */
   clone(): ClaudeResponseParser {
@@ -130,12 +146,18 @@ export class ClaudeResponseParser {
     copy.currentAssistantFragments = new Set(this.currentAssistantFragments);
     copy.turn = this.turn;
     copy.keepAliveTurn = this.keepAliveTurn;
+    copy.skills = new Map(this.skills);
     return copy;
   }
 
   /** The parse so far. The messages array is a copy, so a later line never changes an answer. */
   result(): ClaudeResponseTranscript {
-    return { text: this.lastText, timestamp: this.lastTimestamp, messages: this.messages.slice() };
+    return {
+      text: this.lastText,
+      timestamp: this.lastTimestamp,
+      messages: this.messages.slice(),
+      skills: [...this.skills.values()],
+    };
   }
 
   /** Feed text holding whole lines separated by `\n`. */
@@ -181,6 +203,12 @@ export class ClaudeResponseParser {
     } catch {
       return;
     }
+    // The `/` menu's skills come from every `skill_listing` row (claude-slash-commands.ts).
+    if (entry.type === 'attachment' && entry.attachment?.type === 'skill_listing') {
+      noteSkillListing(this.skills, entry.attachment);
+      return;
+    }
+
     // Sidechains belong to agents/forks, not the main conversation. Meta user
     // rows include repeated image dimensions and other UI-generated context.
     if (entry.isSidechain) return;
@@ -206,6 +234,32 @@ export class ClaudeResponseParser {
 
     if (entry.type === 'user') {
       const text = extractClaudeText(entry.message?.content, '\n').trim();
+      // A slash command the user typed is drawn as typed (`/dual-review`), not as its tags.
+      // `/clear` is left out: it opens the new, empty conversation it belongs to.
+      // A `!` command is drawn as typed too (`!git status`), and its output as a code block.
+      const typed = !entry.isMeta && text ? (typedSlashCommand(text) ?? typedShellCommand(text)) : null;
+      const output = !entry.isMeta && text ? shellCommandOutput(text) : null;
+      if (output !== null) {
+        if (!output || this.currentAssistantFragments.has(output)) return;
+        this.messages.push({
+          kind: 'response',
+          label: 'Response',
+          role: 'assistant',
+          text: output,
+          timestamp: entry.timestamp,
+          turn: this.turn,
+          shellOutput: true,
+        });
+        this.currentAssistantFragments.add(output);
+        // The same command run again after its output is a second run, not a replay.
+        this.currentUserFragments.clear();
+        return;
+      }
+      if (typed !== null) {
+        if (typed === '/clear' || this.currentUserFragments.has(typed)) return;
+        this.pushUserMessage(typed, entry.timestamp, false);
+        return;
+      }
       // A tool_result block has no text block and naturally drops out here.
       if (!text || isClaudeSyntheticUserMessage(entry, text)) return;
       // Claude replays the initial user row while restoring a transcript, and

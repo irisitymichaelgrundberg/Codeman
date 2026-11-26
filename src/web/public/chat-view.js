@@ -56,11 +56,13 @@ const CHAT_VIEW_SEND_BACKOFF_MS = 600;
  */
 const CHAT_VIEW_IDLE_GRACE_MS = 2000;
 /**
- * How long a sent slash command stays drawn as pending when it started no turn. Claude Code
- * records a slash command as tags the conversation leaves out, so the transcript never confirms
- * the pending copy; a command that started a turn stays drawn until the turn ends.
+ * How long a sent slash command stays drawn as pending when it started no turn. Claude writes
+ * some commands to the transcript (the reader draws them as typed, which confirms the pending
+ * copy), others never; a command that started a turn stays drawn until the turn ends.
  */
 const CHAT_VIEW_SLASH_PENDING_MS = 4000;
+/** How long the `/` menu reuses a session's command list before it reads it again. */
+const CHAT_VIEW_SLASH_TTL_MS = 30000;
 
 Object.assign(CodemanApp.prototype, {
   // ─── Eligibility and choice ──────────────────────────────────
@@ -102,6 +104,8 @@ Object.assign(CodemanApp.prototype, {
 
   /** 'chat' or 'terminal' for `sessionId`. */
   chatViewModeFor(sessionId) {
+    // A picker command shows the terminal until the user switches back (_chatViewOpenPicker).
+    if (this._chatViewPickerSessions?.has(sessionId)) return 'terminal';
     const stored = this._chatViewStoredModes()[sessionId];
     if (stored === 'chat' || stored === 'terminal') return stored;
     if (this._chatViewMemoryModes?.has(sessionId)) return this._chatViewMemoryModes.get(sessionId);
@@ -110,6 +114,8 @@ Object.assign(CodemanApp.prototype, {
 
   setChatViewMode(sessionId, mode) {
     if (!sessionId || (mode !== 'chat' && mode !== 'terminal')) return;
+    // A choice the user makes ends a picker's temporary Terminal (_chatViewOpenPicker).
+    this._chatViewPickerSessions?.delete(sessionId);
     if (!this._chatViewMemoryModes) this._chatViewMemoryModes = new Map();
     this._chatViewMemoryModes.set(sessionId, mode);
     const modes = this._chatViewStoredModes();
@@ -282,7 +288,18 @@ Object.assign(CodemanApp.prototype, {
     sendBtn.className = 'chat-view-btn chat-view-btn-primary';
     sendBtn.textContent = 'Send';
     actions.append(attachBtn, fileInput, stopBtn, sendBtn);
-    composer.append(input, actions);
+    // The `/` menu: skills and commands that match what follows the `/`, drawn above the box.
+    const slashMenu = document.createElement('div');
+    slashMenu.className = 'chat-view-slash';
+    slashMenu.id = 'chatViewSlashMenu';
+    slashMenu.setAttribute('role', 'listbox');
+    slashMenu.setAttribute('aria-label', this._chatViewT('Commands'));
+    slashMenu.setAttribute('data-i18n-skip', '');
+    slashMenu.hidden = true;
+    input.setAttribute('aria-controls', slashMenu.id);
+    input.setAttribute('aria-autocomplete', 'list');
+    input.setAttribute('aria-expanded', 'false');
+    composer.append(slashMenu, input, actions);
 
     // The status line follows the last message, inside the scrolling area, so an eye watching
     // the newest output finds it there and not at the bottom of the window.
@@ -291,6 +308,7 @@ Object.assign(CodemanApp.prototype, {
     wrap.append(root, toggle);
 
     input.addEventListener('keydown', (ev) => {
+      if (this._chatViewSlashKey(ev)) return;
       // Firefox and Chromium insert nothing for Alt+Enter in a textarea, so the box adds the
       // line itself. The preventDefault also stops a second line where the browser does add one
       // (Option+Return on macOS), and the input event autosizes the box and saves the draft.
@@ -317,7 +335,17 @@ Object.assign(CodemanApp.prototype, {
       this._chatViewAutosize();
       this._chatViewSyncComposer();
       if (this._chatView?.sessionId) this._chatViewDrafts().set(this._chatView.sessionId, input.value);
+      if (this._chatView) this._chatView.slashDismissed = false;
+      this._chatViewSlashUpdate();
     });
+    // A caret moved by a click or an arrow key can leave or enter the first word.
+    input.addEventListener('click', () => this._chatViewSlashUpdate());
+    input.addEventListener('keyup', (ev) => {
+      if (ev.key === 'ArrowLeft' || ev.key === 'ArrowRight' || ev.key === 'Home' || ev.key === 'End') {
+        this._chatViewSlashUpdate();
+      }
+    });
+    input.addEventListener('blur', () => this._chatViewSlashClose());
     // A pasted screenshot or file goes the way of the paperclip button; pasted text with no file
     // the attach rules admit lands in the box natively, as in the phone's Compose box.
     input.addEventListener('paste', (ev) => {
@@ -331,6 +359,12 @@ Object.assign(CodemanApp.prototype, {
       if (media.length === 0) return;
       ev.preventDefault();
       this._chatViewUpload(media);
+    });
+    // A press on a row must not take focus from the box, or the blur closes the menu first.
+    slashMenu.addEventListener('mousedown', (ev) => {
+      ev.preventDefault();
+      const row = ev.target.closest?.('.chat-view-slash-item');
+      if (row) this._chatViewSlashAccept(Number(row.dataset.index));
     });
     composer.addEventListener('submit', (ev) => {
       ev.preventDefault();
@@ -385,6 +419,12 @@ Object.assign(CodemanApp.prototype, {
       input,
       sendBtn,
       stopBtn,
+      slashMenu,
+      // The open menu's rows and the highlighted one: { query, items, index } or null.
+      slash: null,
+      // Esc closed the menu: a command list that lands later does not reopen it. The dismissal
+      // lasts until the next input event, the menu opening again, or a switch to another session.
+      slashDismissed: false,
       sessionId: null,
       keys: [],
       // The visible messages of the last draw, for matching pending prompts against.
@@ -465,6 +505,7 @@ Object.assign(CodemanApp.prototype, {
 
     const wasShowing = !view.root.hidden;
     const previousId = view.sessionId;
+    if (previousId !== id || !showChat) this._chatViewSlashClose();
     view.root.hidden = !showChat;
     document.querySelector('.terminal-wrap')?.classList.toggle('chat-view-active', showChat);
     // styles.css hides the keyboard accessory bar while this is set: its keys write into the pane.
@@ -480,6 +521,7 @@ Object.assign(CodemanApp.prototype, {
 
     if (previousId !== id) {
       view.sessionId = id;
+      view.slashDismissed = false;
       view.keys = [];
       view.lastMessages = [];
       view.thread.replaceChildren(...this._chatViewPendingEls(id));
@@ -511,6 +553,7 @@ Object.assign(CodemanApp.prototype, {
       clearInterval(this._chatView.statusTimer);
       this._chatView.statusTimer = null;
     }
+    this._chatViewSlashClose();
     this._chatView.root.hidden = true;
     this._chatView.toggle.hidden = true;
     document.querySelector('.terminal-wrap')?.classList.remove('chat-view-active');
@@ -524,9 +567,12 @@ Object.assign(CodemanApp.prototype, {
    */
   _chatViewForget(sessionId) {
     this._chatViewDrafts().delete(sessionId);
+    this._chatViewPickerSessions?.delete(sessionId);
+    this._chatViewClearedAfter?.delete(sessionId);
     this._chatViewTurnStarts?.delete(sessionId);
     this._chatViewIdleSeen?.delete(sessionId);
     this._chatViewKeepAliveTurns?.delete(sessionId);
+    this._chatViewSlashCache?.delete(sessionId);
     if (this._chatView) this._chatView.pending = this._chatView.pending.filter((p) => p.sessionId !== sessionId);
     if (this._chatView?.sessionId === sessionId) {
       this._chatView.sessionId = null;
@@ -686,7 +732,8 @@ Object.assign(CodemanApp.prototype, {
       const data = await this._apiJson(`/api/sessions/${encodeURIComponent(sessionId)}/last-response?context=full`);
       // A read that finished after the user moved on is dropped.
       if (view.sessionId !== sessionId || !this._chatViewShowing()) return;
-      if (data && Array.isArray(data.messages)) this._chatViewRender(data.messages);
+      if (data && Array.isArray(data.messages))
+        this._chatViewRender(this._chatViewAfterClear(sessionId, data.messages));
     } finally {
       view.loading = false;
       if (view.reloadAgain) {
@@ -722,9 +769,14 @@ Object.assign(CodemanApp.prototype, {
     for (let i = from; i < messages.length; i++) {
       const msg = messages[i];
       const previous = i > 0 ? messages[i - 1] : null;
-      // Same rule as the Response Viewer's full view: one badge per speaker per turn.
+      // Same rule as the Response Viewer's full view: one badge per speaker per turn. A `!`
+      // command's output carries no badge, so a reply after it still shows Claude's.
       const continuation =
-        !!previous && previous.role === msg.role && typeof msg.turn === 'number' && previous.turn === msg.turn;
+        !!previous &&
+        !previous.shellOutput &&
+        previous.role === msg.role &&
+        typeof msg.turn === 'number' &&
+        previous.turn === msg.turn;
       const adopted = msg.role === 'user' ? this._chatViewAdoptPending(messages, i, continuation) : null;
       fragment.appendChild(adopted || this._chatViewBuildMessage(msg, agentLabel, continuation));
     }
@@ -740,6 +792,11 @@ Object.assign(CodemanApp.prototype, {
   /** One drawn message. A long prompt folds to its first lines. */
   _chatViewBuildMessage(msg, agentLabel, continuation) {
     const meta = { ...msg, continuation };
+    // The output of a `!` command belongs to the command above it: Claude wrote none of it, so
+    // it gets no badge of Claude's.
+    if (msg.shellOutput) {
+      return this._buildResponseViewerMessage(msg.text, 'assistant', agentLabel, { ...meta, continuation: true });
+    }
     if (msg.role !== 'user') return this._buildResponseViewerMessage(msg.text, 'assistant', agentLabel, meta);
     const text = window.CodemanChatView.promptText(msg.text);
     const fold = window.CodemanChatView.promptFold(text);
@@ -879,6 +936,166 @@ Object.assign(CodemanApp.prototype, {
 
   // ─── Sending ─────────────────────────────────────────────────
 
+  // ─── The `/` menu ──────────────────────────────────────────────
+
+  /**
+   * The session's slash commands (GET /api/sessions/:id/slash-commands), cached for
+   * CHAT_VIEW_SLASH_TTL_MS. Returns what is cached now and starts a read when it is missing or
+   * old; the menu redraws when that read lands. The entry keeps the read in flight as `promise`,
+   * so a caller that needs the list now can await it. Only a read that returned a list counts as
+   * fresh: after a failed one, the next call reads again.
+   */
+  _chatViewSlashCommands(sessionId) {
+    if (!this._chatViewSlashCache) this._chatViewSlashCache = new Map();
+    const entry = this._chatViewSlashCache.get(sessionId);
+    const fresh = entry && Date.now() - entry.at < CHAT_VIEW_SLASH_TTL_MS;
+    if (!fresh && !entry?.loading) {
+      const next = { commands: entry?.commands ?? null, at: entry?.at ?? 0, loading: true };
+      this._chatViewSlashCache.set(sessionId, next);
+      next.promise = this._apiJson(`/api/sessions/${encodeURIComponent(sessionId)}/slash-commands`)
+        .then((data) => {
+          const commands = data?.commands;
+          // A failed read (_apiJson answers null) leaves `at` alone, so the next call retries it.
+          // It also draws nothing: a redraw would start that next read at once, and loop on a
+          // server that keeps failing.
+          if (!Array.isArray(commands)) return;
+          next.commands = commands;
+          next.at = Date.now();
+          // A menu the user closed with Esc stays closed until they type again.
+          if (this._chatView?.sessionId === sessionId && !this._chatView.slashDismissed) this._chatViewSlashUpdate();
+        })
+        .catch(() => {})
+        .finally(() => {
+          next.loading = false;
+        });
+    }
+    return this._chatViewSlashCache.get(sessionId)?.commands ?? null;
+  },
+
+  /** Open, redraw or close the menu for the message box's current text and caret. */
+  _chatViewSlashUpdate() {
+    const view = this._chatView;
+    if (!view || !view.sessionId || !this._chatViewShowing() || document.activeElement !== view.input) {
+      this._chatViewSlashClose();
+      return;
+    }
+    const helpers = window.CodemanChatView;
+    const query = helpers?.slashQuery(view.input.value, view.input.selectionStart);
+    if (query === null || query === undefined) {
+      this._chatViewSlashClose();
+      return;
+    }
+    const commands = this._chatViewSlashCommands(view.sessionId);
+    const items = commands ? helpers.slashMatches(commands, query) : [];
+    if (items.length === 0) {
+      this._chatViewSlashClose();
+      return;
+    }
+    const keep = view.slash && view.slash.query === query ? view.slash.index : 0;
+    // The menu opens again (a click or a caret key), so the Esc dismissal is over.
+    view.slashDismissed = false;
+    view.slash = { query, items, index: Math.min(keep, items.length - 1) };
+    this._chatViewSlashRender();
+  },
+
+  _chatViewSlashRender() {
+    const view = this._chatView;
+    const slash = view?.slash;
+    if (!slash) return;
+    const rows = slash.items.map((command, index) => {
+      const row = document.createElement('div');
+      row.className = 'chat-view-slash-item';
+      row.id = `chatViewSlashItem${index}`;
+      row.setAttribute('role', 'option');
+      row.dataset.index = String(index);
+      const selected = index === slash.index;
+      row.setAttribute('aria-selected', String(selected));
+      if (selected) row.classList.add('chat-view-slash-item--active');
+      const name = document.createElement('span');
+      name.className = 'chat-view-slash-name';
+      name.textContent = `/${command.name}`;
+      const description = document.createElement('span');
+      description.className = 'chat-view-slash-desc';
+      // A built-in's description is Codeman's own text, so it reads in the page's language; a
+      // skill's comes from the user's file and stays as written.
+      description.textContent =
+        command.kind === 'builtin' ? this._chatViewT(command.description || '') : command.description || '';
+      row.append(name, description);
+      return row;
+    });
+    view.slashMenu.replaceChildren(...rows);
+    view.slashMenu.hidden = false;
+    view.input.setAttribute('aria-expanded', 'true');
+    view.input.setAttribute('aria-activedescendant', `chatViewSlashItem${slash.index}`);
+    rows[slash.index]?.scrollIntoView?.({ block: 'nearest' });
+  },
+
+  _chatViewSlashClose() {
+    const view = this._chatView;
+    if (!view || (!view.slash && view.slashMenu.hidden)) return;
+    view.slash = null;
+    view.slashMenu.hidden = true;
+    view.slashMenu.replaceChildren();
+    view.input.setAttribute('aria-expanded', 'false');
+    view.input.removeAttribute('aria-activedescendant');
+  },
+
+  /** Put `/<name> ` in place of the first word, keep the rest of the text, and close. */
+  _chatViewSlashAccept(index) {
+    const view = this._chatView;
+    const command = view?.slash?.items[index];
+    if (!command) return;
+    const value = view.input.value;
+    const end = value.search(/\s/);
+    const rest = end === -1 ? '' : value.slice(end).replace(/^[ \t]+/, '');
+    const head = `/${command.name} `;
+    view.input.value = head + rest;
+    view.input.setSelectionRange(head.length, head.length);
+    this._chatViewSlashClose();
+    view.input.dispatchEvent(new Event('input'));
+  },
+
+  /**
+   * The menu's keys, while it is open: arrows move, Tab completes, Enter completes and Esc closes.
+   * Once the word is the highlighted command's whole name, Enter closes the menu and is left to
+   * the composer, which sends on a desktop and adds a line on a touch device (chatViewEnterSends).
+   * True when the key was the menu's.
+   */
+  _chatViewSlashKey(ev) {
+    const view = this._chatView;
+    const slash = view?.slash;
+    if (!slash || ev.isComposing || ev.keyCode === 229) return false;
+    const count = slash.items.length;
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      slash.index = (slash.index + (ev.key === 'ArrowDown' ? 1 : count - 1)) % count;
+      this._chatViewSlashRender();
+      return true;
+    }
+    if (ev.key === 'Escape') {
+      ev.preventDefault();
+      ev.stopPropagation();
+      view.slashDismissed = true;
+      this._chatViewSlashClose();
+      return true;
+    }
+    if (ev.key === 'Tab' && !ev.shiftKey) {
+      ev.preventDefault();
+      this._chatViewSlashAccept(slash.index);
+      return true;
+    }
+    if (ev.key === 'Enter' && !ev.shiftKey && !ev.altKey && !ev.ctrlKey && !ev.metaKey) {
+      if (slash.items[slash.index]?.name.toLowerCase() === slash.query.toLowerCase()) {
+        this._chatViewSlashClose();
+        return false;
+      }
+      ev.preventDefault();
+      this._chatViewSlashAccept(slash.index);
+      return true;
+    }
+    return false;
+  },
+
   async _chatViewSend() {
     const view = this._chatView;
     const sessionId = view?.sessionId;
@@ -886,6 +1103,18 @@ Object.assign(CodemanApp.prototype, {
     const value = view.input.value;
     const payload = window.CodemanChatView?.sendPayload(value);
     if (!payload) return;
+    const intent = window.CodemanChatView?.slashIntent(value) ?? null;
+    // `/quit` and `/exit` close the session the way the tab's close button does, at once,
+    // rather than waiting for the agent to exit and the server to notice the pane is gone.
+    if (intent?.kind === 'close' && typeof this.closeSession === 'function') {
+      view.input.value = '';
+      this._chatViewSlashClose();
+      this._chatViewDrafts().delete(sessionId);
+      this._chatViewAutosize();
+      this._chatViewSyncComposer();
+      void this.closeSession(sessionId, true);
+      return;
+    }
     // A dialog in the pane would take the text and the Enter. The box keeps the message.
     if (this._chatViewDialogPending(sessionId)) {
       const agent = this._getResponseViewerAgentLabel?.() || 'Claude';
@@ -903,11 +1132,13 @@ Object.assign(CodemanApp.prototype, {
     }
     const seq = ++this._chatViewSeq;
     view.sending = true;
-    // Show the prompt at once and empty the box; a failed send puts the text back.
-    // The pending copy shows what goes to the pane: the payload without its submitting CR.
-    const pending = this._chatViewAddPending(sessionId, payload.slice(0, -1));
+    // Show the prompt at once and empty the box; a failed send puts the text back. `/clear` gets
+    // no bubble: it empties the thread instead (_chatViewClearThread). The pending copy shows what
+    // goes to the pane: the payload without its submitting CR.
+    const pending = intent?.kind === 'clear' ? null : this._chatViewAddPending(sessionId, payload.slice(0, -1));
     if (view.sessionId === sessionId) {
       view.input.value = '';
+      this._chatViewSlashClose();
       this._chatViewAutosize();
     }
     this._chatViewDrafts().delete(sessionId);
@@ -942,21 +1173,27 @@ Object.assign(CodemanApp.prototype, {
       view.sending = false;
     }
     if (sent) {
+      if (intent?.kind === 'clear') this._chatViewClearThread(sessionId);
+      if (intent?.kind === 'bare') void this._chatViewOpenPicker(sessionId, intent.name);
+    }
+    if (sent && pending) {
       pending.postedAt = Date.now();
       // The user's own prompt makes the running turn theirs, as the server's endKeepAliveTurn()
       // treats any other submit, so the status line and Stop show for it again.
       this._chatViewKeepAliveTurns?.delete(sessionId);
       if (view.sessionId === sessionId) this._chatViewRenderStatus();
       if (/^\s*\//.test(value)) {
-        // A command such as `/compact` or a skill runs a turn, which can last minutes. While it
-        // runs, the bubble stays drawn, and the end of the turn lets it go (onChatViewTurnEvent).
+        // Claude Code writes `/compact` to the transcript only when its turn ends, which can be
+        // minutes later. While that turn runs, the bubble stays drawn, and the end of the turn
+        // lets it go (onChatViewTurnEvent). A skill's row arrives as its turn starts and takes
+        // the bubble's place then.
         setTimeout(() => {
           if (!this._chatViewBusy(sessionId)) this._chatViewDropPending(pending);
         }, CHAT_VIEW_SLASH_PENDING_MS);
       }
       this._chatViewReload();
-    } else {
-      this._chatViewDropPending(pending);
+    } else if (!sent) {
+      if (pending) this._chatViewDropPending(pending);
       // Put the text back. When something was typed meanwhile, the failed message goes first and
       // what was typed follows it after a blank line, so neither is lost. The draft is written
       // too: a view switch that bypasses onChatViewActiveSession (the tile grid) reloads the box
@@ -976,6 +1213,58 @@ Object.assign(CodemanApp.prototype, {
       );
     }
     this._chatViewSyncComposer();
+  },
+
+  /**
+   * After `/clear`: empty the thread at once. Until the server reads the new conversation, every
+   * message no newer than the newest one drawn now belongs to the old one, so a read that still
+   * returns it is cut to what came after (_chatViewFetch). The cut is the newest drawn timestamp,
+   * which comes from the server's clock. When the thread holds no timestamped message, the
+   * browser's clock stands in, so a browser clock ahead of the server's can hide the new
+   * conversation's first messages until their timestamps pass it. The server moves to the new
+   * conversation when Claude's statusline reports it, about a second after the `/clear`. A
+   * session without the statusline exporter (Docker, or Plan Usage Limits off) moves with its
+   * next prompt.
+   */
+  _chatViewClearThread(sessionId) {
+    const view = this._chatView;
+    const drawn = view?.sessionId === sessionId ? view.lastMessages : [];
+    const newest = Math.max(0, ...drawn.map((m) => Date.parse(m.timestamp)).filter((t) => Number.isFinite(t)));
+    if (!this._chatViewClearedAfter) this._chatViewClearedAfter = new Map();
+    this._chatViewClearedAfter.set(sessionId, newest || Date.now());
+    if (view?.sessionId === sessionId && this._chatViewShowing()) this._chatViewRender([]);
+  },
+
+  /**
+   * The messages of a read, without the ones from before a `/clear` sent from this page while
+   * the server still reads the old conversation. Once a read holds nothing older, the server has
+   * moved to the new conversation, and the cut is dropped.
+   */
+  _chatViewAfterClear(sessionId, messages) {
+    const cut = this._chatViewClearedAfter?.get(sessionId);
+    if (cut === undefined) return messages;
+    const kept = messages.filter((m) => Date.parse(m.timestamp) > cut);
+    if (kept.length === messages.length) this._chatViewClearedAfter.delete(sessionId);
+    return kept;
+  },
+
+  /**
+   * A bare built-in such as `/model` or `/config` opens a picker or panel inside Claude's
+   * terminal interface, which the chat view cannot draw. Show the terminal for it, without
+   * changing the session's remembered choice; switching back (the switch or Alt+Shift+C) ends it.
+   */
+  async _chatViewOpenPicker(sessionId, name) {
+    let commands = this._chatViewSlashCommands(sessionId);
+    if (!commands) {
+      // Nothing cached yet: wait for the read that call has just started.
+      await this._chatViewSlashCache.get(sessionId)?.promise;
+      commands = this._chatViewSlashCache.get(sessionId)?.commands ?? [];
+    }
+    if (!commands.some((command) => command.name === name && command.opensTerminal)) return;
+    if (!this._chatViewPickerSessions) this._chatViewPickerSessions = new Set();
+    this._chatViewPickerSessions.add(sessionId);
+    if (this.activeSessionId === sessionId) this._chatViewSync({ focus: true });
+    this.showToast?.(this._chatViewT(`/${name} opens in the terminal. Press Alt+Shift+C to go back to Chat.`), 'info');
   },
 
   /** Interrupt the running turn: Esc, the key Claude stops on. */

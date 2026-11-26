@@ -16,6 +16,8 @@ import { finished } from 'node:stream/promises';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { isUtf8 } from 'node:buffer';
 import { performance } from 'node:perf_hooks';
+import { CLAUDE_BUILTIN_COMMANDS, mergeSlashCommands } from '../../claude-slash-commands.js';
+import { readSlashCommandFiles, type SlashCommandRoot } from '../../claude-slash-command-files.js';
 import {
   ApiErrorCode,
   createErrorResponse,
@@ -33,6 +35,7 @@ import {
   type DeepSeekConfig,
   type OmpConfig,
   type RemoteHost,
+  type SlashCommand,
 } from '../../types.js';
 import { AdoptForeignSessionSchema } from '../schemas.js';
 import {
@@ -3250,9 +3253,16 @@ export function registerSessionRoutes(
     try {
       const parsed = await claudeTranscripts.read(transcript.path);
       if (context === 'turn') {
-        return { text: parsed.text, timestamp: parsed.timestamp, messages: selectLastAnsweredTurn(parsed.messages) };
+        return {
+          text: parsed.text,
+          timestamp: parsed.timestamp,
+          // A `!` command's output is no answer of Claude's, so a turn holding only that is unanswered.
+          messages: selectLastAnsweredTurn(parsed.messages.filter((message) => !message.shellOutput)),
+        };
       }
-      return wantsMessages ? parsed : { text: parsed.text, timestamp: parsed.timestamp };
+      return wantsMessages
+        ? { text: parsed.text, timestamp: parsed.timestamp, messages: parsed.messages }
+        : { text: parsed.text, timestamp: parsed.timestamp };
     } catch {
       return wantsMessages ? { text: '', timestamp: '', messages: [] } : { text: '', timestamp: '' };
     }
@@ -3263,6 +3273,61 @@ export function registerSessionRoutes(
     const { id } = req.params as { id: string };
     const session = findSessionOrFail(ctx, id, req);
     return lastResponseFor(session, (req.query as { context?: string }).context);
+  });
+
+  async function transcriptSkills(path: string): Promise<SlashCommand[]> {
+    // Probe first (#516): the path may sit in a relocated config folder on a mount that stopped
+    // answering, and a plain open there would hold a threadpool worker.
+    if ((await probePathKind(path)) !== 'file') return [];
+    // The same reader as lastResponseFor(), so a `/` parses only what was appended since.
+    return (await claudeTranscripts.read(path).catch(() => null))?.skills ?? [];
+  }
+
+  /**
+   * GET /api/sessions/:id/slash-commands: what the chat view's `/` menu offers for a session
+   * whose CLI writes a Claude-format transcript (claude-slash-commands.ts names the sources).
+   * Any other session answers an empty list. Read-only. The skill and command file reads are
+   * bounded (claude-slash-command-files.ts). The transcript path is probed bounded first and then
+   * read through the reader lastResponseFor() uses.
+   */
+  app.get('/api/sessions/:id/slash-commands', async (req) => {
+    const { id } = req.params as { id: string };
+    const session = findSessionOrFail(ctx, id, req);
+    if (getCli(session.mode)?.capabilities.transcript !== 'claude-jsonl' || session.isAdopted || session.remote) {
+      return { success: true, data: { commands: [] } };
+    }
+
+    let listed: SlashCommand[] = [];
+    const dirs = await claudeConversationDirs(session);
+    // The watcher's path is the host's, a Docker session's included (hostTranscriptPath in
+    // claude-conversation-report.ts). Without a watcher the scan below finds the file.
+    const hookPath = ctx.getTranscriptPath(session.id);
+    const transcriptPath =
+      hookPath ??
+      (dirs
+        ? (await findClaudeTranscript(dirs.projectsDir, session.claudeSessionId || session.id, session.id))?.path
+        : null);
+    if (transcriptPath) listed = await transcriptSkills(transcriptPath);
+
+    // The workspace's own `.claude` first, then the user's config folder. A Docker session's
+    // config folder is the container's, so only its bind-mounted workspace is read here. A
+    // workspace file must resolve inside the workspace, so a link in it cannot list a file elsewhere.
+    const roots: SlashCommandRoot[] = [];
+    if ((await probePathKind(session.workingDir)) === 'directory') {
+      const workspace = await fs.realpath(session.workingDir).catch(() => null);
+      if (workspace) roots.push({ dir: join(session.workingDir, '.claude'), confineTo: workspace });
+    }
+    // The config folder is judged on its own, not through `dirs`: a relocated folder with no
+    // `projects` yet (a new session's) still holds its skills and commands.
+    if (!session.docker) {
+      const configDir = dirname(claudeProjectsDir(session.claudeConfigDir()));
+      if (configDir === join(homedir(), '.claude') || (await probePathKind(configDir)) === 'directory') {
+        roots.push({ dir: configDir });
+      }
+    }
+    const onDisk = await readSlashCommandFiles(roots);
+
+    return { success: true, data: { commands: mergeSlashCommands(listed, onDisk, [...CLAUDE_BUILTIN_COMMANDS]) } };
   });
 
   function isCodexInjectedContext(text: string): boolean {

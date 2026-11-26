@@ -113,6 +113,82 @@ describe('GET /api/sessions/:id/last-response (claude)', () => {
     return { response, body: JSON.parse(response.body) };
   }
 
+  it('draws a typed slash command as typed, leaves out the skill body and /clear', async () => {
+    const id = harness.ctx._session.id;
+    (harness.ctx._session as typeof harness.ctx._session & { claudeSessionId: string }).claudeSessionId = id;
+    harness.ctx._session.mode = 'claude';
+    writeTranscript(id, [
+      // Claude Code 2.1.331's rows for a typed skill: the command, then the skill body as a meta row.
+      userEntry('<command-message>dual-review</command-message>\n<command-name>/dual-review</command-name>'),
+      userEntry('Base directory for this skill: /x/.claude/skills/dual-review\n\n# Dual review', { isMeta: true }),
+      assistantEntry('Both reviews are done.', '2026-07-21T00:00:01Z'),
+      // A built-in with arguments, and a /clear.
+      userEntry(
+        '<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>opus</command-args>'
+      ),
+      userEntry(
+        '<command-name>/clear</command-name>\n<command-message>clear</command-message>\n<command-args></command-args>'
+      ),
+    ]);
+    const full = await getLastResponse(id, true);
+    expect(full.body.data.messages.map((m: { role: string; text: string }) => [m.role, m.text])).toEqual([
+      ['user', '/dual-review'],
+      ['assistant', 'Both reviews are done.'],
+      ['user', '/model opus'],
+    ]);
+  });
+
+  it('draws a `!` command as typed, and its output as a code block Claude did not write', async () => {
+    const id = harness.ctx._session.id;
+    (harness.ctx._session as typeof harness.ctx._session & { claudeSessionId: string }).claudeSessionId = id;
+    harness.ctx._session.mode = 'claude';
+    writeTranscript(id, [
+      // Claude Code 2.1.331's rows for `!git status`: the command, then its output.
+      userEntry('<bash-input>git status</bash-input>'),
+      userEntry('<bash-stdout>On branch main</bash-stdout><bash-stderr></bash-stderr>'),
+      // The same command again is a second run, and a command that printed nothing draws no output.
+      userEntry('<bash-input>git status</bash-input>'),
+      userEntry('<bash-stdout>On branch main</bash-stdout><bash-stderr></bash-stderr>'),
+      userEntry('<bash-input>true</bash-input>'),
+      userEntry('<bash-stdout></bash-stdout><bash-stderr></bash-stderr>'),
+    ]);
+    const full = await getLastResponse(id, true);
+    const messages = full.body.data.messages as { role: string; text: string; shellOutput?: boolean }[];
+    expect(messages.map((m) => [m.role, m.text, !!m.shellOutput])).toEqual([
+      ['user', '!git status', false],
+      ['assistant', '```\nOn branch main\n```', true],
+      ['user', '!git status', false],
+      ['assistant', '```\nOn branch main\n```', true],
+      ['user', '!true', false],
+    ]);
+    // Shell output is never Claude's last message.
+    const last = await getLastResponse(id);
+    expect(last.body.data.text ?? '').not.toContain('On branch main');
+  });
+
+  it('draws a replayed typed command once, and a repeat after a reply twice', async () => {
+    const id = harness.ctx._session.id;
+    (harness.ctx._session as typeof harness.ctx._session & { claudeSessionId: string }).claudeSessionId = id;
+    harness.ctx._session.mode = 'claude';
+    const typedRows = (full: { body: { data: { messages: { role: string; text: string }[] } } }) =>
+      full.body.data.messages.filter((m) => m.role === 'user' && m.text === '/compact').length;
+
+    // A restore replays the command row before any assistant text: it is drawn once.
+    writeTranscript(id, [
+      userEntry('<command-name>/compact</command-name>'),
+      userEntry('<command-name>/compact</command-name>'),
+    ]);
+    expect(typedRows(await getLastResponse(id, true))).toBe(1);
+
+    // The same command typed again after a reply is a second turn: it is drawn twice.
+    writeTranscript(id, [
+      userEntry('<command-name>/compact</command-name>'),
+      assistantEntry('Compacted.', '2026-07-21T00:00:01Z'),
+      userEntry('<command-name>/compact</command-name>'),
+    ]);
+    expect(typedRows(await getLastResponse(id, true))).toBe(2);
+  });
+
   it('recovers a placeholder tmux session by UUID prefix and renders one message per model message', async () => {
     const restoredId = 'restored-40568a29';
     const conversationId = '40568a29-d4eb-4eb6-b671-8401428e4f39';
@@ -157,7 +233,9 @@ describe('GET /api/sessions/:id/last-response (claude)', () => {
       timestamp: '2026-07-21T00:00:06Z',
       // #169's guarantees all still hold and this array proves them: the replayed
       // 'first prompt' row, the replayed 'Checking the files.' snapshot, the
-      // sidechain row and all five synthetic rows are absent. Only the GROUPING
+      // sidechain row and the four synthetic rows are absent. The typed `/status`
+      // command shows as the user typed it, in the same turn as the prompt after it.
+      // Only the GROUPING
       // UNIT narrows, from one card per human turn to one card per model
       // message, carried by `turn` instead of by a '\n\n' joiner.
       messages: [
@@ -184,6 +262,14 @@ describe('GET /api/sessions/:id/last-response (claude)', () => {
           text: 'The first result is ready.',
           timestamp: '2026-07-21T00:00:03Z',
           turn: 1,
+        },
+        {
+          kind: 'prompt',
+          label: 'Prompt',
+          role: 'user',
+          text: '/status',
+          timestamp: '2026-07-21T00:00:00Z',
+          turn: 2,
         },
         {
           kind: 'prompt',
@@ -637,6 +723,29 @@ describe('GET /api/sessions/:id/last-response (claude)', () => {
 
     const brief = await getLastResponse(sessionId);
     expect(brief.body.data).toEqual({ text: 'Done.', timestamp: '2026-07-21T00:00:04Z' });
+  });
+
+  it("answers context=turn with Claude's last answer, not a later `!` command's output", async () => {
+    const sessionId = harness.ctx._session.id;
+    const session = harness.ctx._session as typeof harness.ctx._session & {
+      claudeSessionId: string;
+      adoptClaudeSessionId: ReturnType<typeof vi.fn>;
+    };
+    session.claudeSessionId = sessionId;
+    session.adoptClaudeSessionId = vi.fn();
+    writeTranscript(sessionId, [
+      userEntry('first'),
+      assistantEntry('The answer.', '2026-07-21T00:00:01Z'),
+      userEntry('<bash-input>ls</bash-input>'),
+      userEntry('<bash-stdout>src</bash-stdout><bash-stderr></bash-stderr>'),
+    ]);
+    const response = await harness.app.inject({
+      method: 'GET',
+      url: `/api/sessions/${sessionId}/last-response?context=turn`,
+    });
+    const data = JSON.parse(response.body).data as { text: string; messages: Array<{ role: string; text: string }> };
+    expect(data.text).toBe('The answer.');
+    expect(data.messages.map((m) => [m.role, m.text])).toEqual([['assistant', 'The answer.']]);
   });
 
   it('answers context=turn with an empty list when nothing has been answered yet', async () => {

@@ -1661,6 +1661,69 @@ function chatViewSendPayload(value) {
   return `${text}\r`;
 }
 
+/**
+ * What a message box value asks of the chat view beyond sending it, when it is a slash command
+ * with nothing after it: `close` for `/quit` and `/exit` (the chat view closes the session
+ * itself, as the tab's close button does), `clear` for `/clear` (the thread empties at once),
+ * and `bare` with the command's name for any other one (which may open a picker in the
+ * terminal). Null for anything else, a command with arguments included.
+ */
+function chatViewSlashIntent(value) {
+  const match = /^\/([A-Za-z0-9][A-Za-z0-9._:-]*)$/.exec(String(value ?? '').trim());
+  if (!match) return null;
+  const name = match[1];
+  if (name === 'quit' || name === 'exit') return { kind: 'close', name };
+  if (name === 'clear') return { kind: 'clear', name };
+  return { kind: 'bare', name };
+}
+
+/** Most rows the `/` menu shows at once. */
+const CHAT_SLASH_MENU_MAX = 50;
+
+/**
+ * What the user is typing after `/`, while the caret is still in the message's first word and
+ * that word starts with `/`: '' right after the `/`, null otherwise.
+ */
+function chatViewSlashQuery(value, caret) {
+  const text = String(value ?? '');
+  if (!text.startsWith('/')) return null;
+  const end = text.search(/\s/);
+  const tokenEnd = end === -1 ? text.length : end;
+  if (typeof caret === 'number' && caret > tokenEnd) return null;
+  return text.slice(1, tokenEnd);
+}
+
+/**
+ * The commands that match `query`, best first: an exact name, then names that start with it,
+ * then names where a word starts with it (after `:`, `-` or `_`), then names that contain it,
+ * then descriptions where a word starts with it. Case is ignored, and input order breaks ties.
+ */
+function chatViewSlashMatches(commands, query, limit = CHAT_SLASH_MENU_MAX) {
+  const q = String(query ?? '').toLowerCase();
+  const ranked = [];
+  (Array.isArray(commands) ? commands : []).forEach((command, index) => {
+    const name = String(command?.name ?? '').toLowerCase();
+    if (!name) return;
+    let rank;
+    if (q === '') rank = 1;
+    else if (name === q) rank = 0;
+    else if (name.startsWith(q)) rank = 1;
+    else if (name.split(/[:_-]/).some((word) => word.startsWith(q))) rank = 2;
+    else if (name.includes(q)) rank = 3;
+    else if (
+      String(command.description ?? '')
+        .toLowerCase()
+        .split(/[^\p{L}\p{N}]+/u)
+        .some((word) => word.startsWith(q))
+    )
+      rank = 4;
+    else return;
+    ranked.push({ command, rank, index });
+  });
+  ranked.sort((a, b) => a.rank - b.rank || a.index - b.index);
+  return ranked.slice(0, limit).map((entry) => entry.command);
+}
+
 if (typeof window !== 'undefined') {
   window.WEBGL_FALLBACK = WEBGL_FALLBACK;
   window.evaluateWebGLLongTaskTrip = evaluateWebGLLongTaskTrip;
@@ -1739,6 +1802,9 @@ if (typeof window !== 'undefined') {
     elapsed: chatViewElapsed,
     enterSends: chatViewEnterSends,
     sendPayload: chatViewSendPayload,
+    slashQuery: chatViewSlashQuery,
+    slashMatches: chatViewSlashMatches,
+    slashIntent: chatViewSlashIntent,
   };
   window.CodemanInputLimit = {
     FRAME_MAX_CHARS: INPUT_FRAME_MAX_CHARS,

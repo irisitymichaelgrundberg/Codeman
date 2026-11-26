@@ -1462,6 +1462,11 @@ class CodemanApp {
           this.handleTabRailSearchKeydown(e);
           return;
         }
+        // The chat view's `/` menu: Escape closes the menu alone (chat-view.js).
+        if (e.target?.classList?.contains('chat-view-input') && this._chatView?.slash) {
+          this._chatViewSlashClose();
+          return;
+        }
         // The local model window can sit on top of App Settings (it opens from a
         // row there): Escape closes the window alone and leaves Settings open.
         if (this.isLocalModelWindowOpen?.()) {
@@ -2989,11 +2994,16 @@ class CodemanApp {
    * The raw Markdown of the newest answer in a message list: every row of its
    * turn, or the last row when the reader emits no numeric turns (Codex, the
    * pane parser). Tool and status blocks share the assistant role but are not
-   * the answer.
+   * the answer, and neither is a `!` command's output, which Claude did not write.
    */
   _responseViewerMarkdownFrom(messages) {
     const answers = messages.filter(
-      (msg) => msg && msg.role === 'assistant' && (!msg.kind || msg.kind === 'response') && msg.text?.trim()
+      (msg) =>
+        msg &&
+        msg.role === 'assistant' &&
+        (!msg.kind || msg.kind === 'response') &&
+        !msg.shellOutput &&
+        msg.text?.trim()
     );
     const last = answers[answers.length - 1];
     if (!last) return '';

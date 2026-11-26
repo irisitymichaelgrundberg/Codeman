@@ -7,6 +7,8 @@
  * - the "too long" and "not sent" toasts are taken by their own patterns, ahead of the bare
  *   `Message (.+)` one, which would otherwise turn them into a garbled "send a message to" line;
  * - the setting that shows or hides the Chat / Terminal switch reads in Chinese.
+ * - the toast for a picker command that opens in the terminal keeps the command;
+ * - every built-in command description in the `/` menu has a Chinese entry of its own.
  *
  * Port: N/A.
  */
@@ -15,6 +17,7 @@ import { resolve } from 'node:path';
 import vm from 'node:vm';
 import { JSDOM } from 'jsdom';
 import { afterAll, describe, expect, it } from 'vitest';
+import { CLAUDE_BUILTIN_COMMANDS } from '../src/claude-slash-commands.js';
 
 const I18N = readFileSync(resolve(import.meta.dirname, '../src/web/public/i18n.js'), 'utf8');
 
@@ -38,6 +41,10 @@ describe('the chat view in zh-CN', () => {
 
   it('takes the refused-send toast by its own pattern and keeps the reason', () => {
     expect(api.t('Message not sent: Input too long')).toBe('消息未发送：Input too long');
+  });
+
+  it("translates the `/` menu's accessible name", () => {
+    expect(api.t('Commands')).toBe('命令');
   });
 
   it('translates the message box placeholders', () => {
@@ -75,5 +82,20 @@ describe('the chat view in zh-CN', () => {
         'Show the Chat / Terminal switch at the top right of a Claude session. Alt+Shift+C switches views without it. Not on phones.'
       )
     ).toBe('在 Claude 会话右上角显示聊天 / 终端开关。没有它时，Alt+Shift+C 也能切换视图。手机上不可用。');
+  });
+
+  it('takes the picker toast by its own pattern and keeps the command', () => {
+    expect(api.t('/model opens in the terminal. Press Alt+Shift+C to go back to Chat.')).toBe(
+      '/model 在终端中打开。按 Alt+Shift+C 返回聊天。'
+    );
+  });
+
+  it("translates every built-in command's description in the `/` menu", () => {
+    for (const command of CLAUDE_BUILTIN_COMMANDS) {
+      const text = api.t(command.description);
+      expect(text, command.name).not.toBe(command.description);
+      expect(text, command.name).toMatch(/[\u4e00-\u9fff]/);
+    }
+    expect(api.t("Set the model's effort level")).toBe('设置模型的思考强度');
   });
 });

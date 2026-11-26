@@ -31,6 +31,7 @@
  * | mcp-sync     | McpSyncResult, McpSyncTargetResult                                    | Other CLIs' own config files → `GET`/`POST /api/mcp-sync` |
  * | local-model  | HardwareFacts, LocalModelCatalog, Candidate, Recommendation, RecommendOptions, LOCAL_MODEL_LABELS | In-memory only (nothing persisted) → `GET /api/local-model` |
  * | local-model-install | LocalModelStatus, LocalModelInstallView, LocalModelStateFile, LocalModelRuntimePin, LOCAL_MODEL_INSTALL_LABELS | `~/.codeman/local-model.json` → `GET /api/local-model` and its install verbs |
+ * | slash-commands | SlashCommand, SlashCommandKind                                      | In-memory only → `GET /api/sessions/:id/slash-commands` |
  *
  * ## Cross-domain relationship map
  *
@@ -81,3 +82,4 @@ export * from './foreign-tmux.js';
 export * from './mcp-sync.js';
 export * from './local-model.js';
 export * from './local-model-install.js';
+export * from './slash-commands.js';

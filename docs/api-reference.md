@@ -613,6 +613,13 @@ keep-warm sent. The nudge prompt and the reply to it both carry `keepAlive: true
 client can leave them out as the chat view does. A prompt the user queued during that
 turn makes the turn theirs, and its later messages carry no flag.
 
+A command the user ran with `!` reads as typed (`!git status`). Its output follows as a
+`response` message with `shellOutput: true`, whose text is one fenced code block of the
+command's standard output and then its standard error. Claude wrote none of that
+output, so a client can draw it without Claude's name. A command that printed nothing
+has no output message. Shell output never becomes the read's last response `text`, and it
+is never part of the `context=turn` read.
+
 A full read of a Claude transcript also starts a transcript watcher when none runs for
 the session. A watcher normally starts at the session's first hook or statusline report,
 so a session picked up after a server restart has none until one of those arrives. The
@@ -620,6 +627,43 @@ read starts one from the file it found, and the session's `transcript:*` events 
 mid-turn. After a `/clear`, a read moves a watcher it started itself to the conversation's
 new file. It never replaces or moves a watcher that a hook or a statusline report started,
 and it starts none for a remote SSH session, whose transcript is not on this host.
+
+### `GET /api/v1/sessions/:id/slash-commands`
+
+The route lists the slash commands the chat view's `/` menu offers for a session:
+
+```json
+{
+  "success": true,
+  "data": {
+    "commands": [
+      { "name": "compact", "description": "Free up context by summarizing the conversation so far", "kind": "builtin" }
+    ]
+  }
+}
+```
+
+`name` has no leading `/`, and a plugin's skill keeps its `plugin:` prefix. `kind` is
+`builtin`, `skill` or `command`. A built-in whose bare form opens a picker or a panel
+inside Claude's terminal interface, such as `/model` or `/config`, also carries
+`opensTerminal: true`. Every other entry leaves the field out. The list merges three sources, and the first source to
+name a command wins:
+
+1. The `skill_listing` rows of the session's transcript, which list the skills and prompt
+   commands Claude Code offers.
+2. Skill and command files in the workspace's `.claude` folder and in the user's Claude
+   config folder. A Docker session reads only its workspace, because its config folder
+   is the container's.
+3. The built-in commands Claude Code handles itself.
+
+The answer is sorted by name and carries at most 400 entries. The skill and command
+file reads are bounded: the route reads a capped number of entries per folder, folders
+only a few levels deep, a capped number of files per request, and the first 16 KiB of
+each file. The route reads the transcript whole, as `GET /api/sessions/:id/last-response`
+does, after a bounded probe of its path. Descriptions are text from files somebody else
+wrote, so render them as text.
+A session whose CLI does not write a Claude-format transcript (`capabilities.transcript`
+other than `claude-jsonl`) gets an empty list. So do remote SSH and adopted sessions.
 
 ## Experimental bounded agent inspection and guarded input
 

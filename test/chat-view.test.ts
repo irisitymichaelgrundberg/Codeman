@@ -41,6 +41,9 @@ interface ChatHelpers {
   elapsed: (ms: number) => string;
   enterSends: (ev: Record<string, unknown>, touch: boolean) => boolean;
   sendPayload: (v: string) => string | null;
+  slashQuery: (value: string, caret?: number) => string | null;
+  slashMatches: (commands: { name: string; description?: string }[], query: string) => { name: string }[];
+  slashIntent: (value: string) => { kind: string; name: string } | null;
 }
 
 function loadHelpers(): ChatHelpers {
@@ -153,6 +156,53 @@ describe('CodemanChatView helpers', () => {
   });
 });
 
+describe('slash command helpers', () => {
+  const h = loadHelpers();
+
+  it('reads the word after / only while the caret is still in the first word', () => {
+    expect(h.slashQuery('/', 1)).toBe('');
+    expect(h.slashQuery('/rev', 4)).toBe('rev');
+    expect(h.slashQuery('/review the diff', 3)).toBe('review');
+    expect(h.slashQuery('/review the diff', 10)).toBeNull();
+    expect(h.slashQuery('hello /rev', 10)).toBeNull();
+    expect(h.slashQuery(' /rev', 4)).toBeNull();
+  });
+
+  it('ranks an exact name, then name prefixes, word prefixes, substrings and descriptions', () => {
+    const commands = [
+      { name: 'anthropic-skills:pdf', description: 'PDF files' },
+      { name: 'code-review', description: 'Review the diff' },
+      { name: 'compact', description: 'Summarize the conversation' },
+      { name: 'dual-review', description: 'Two reviewers' },
+      { name: 'preview', description: '' },
+      { name: 'review', description: '' },
+      { name: 'reviewer-notes', description: '' },
+      { name: 'skills', description: 'List available skills' },
+    ];
+    expect(h.slashMatches(commands, 'review').map((c) => c.name)).toEqual([
+      'review',
+      'reviewer-notes',
+      'code-review',
+      'dual-review',
+      'preview',
+    ]);
+    expect(h.slashMatches(commands, 'PDF').map((c) => c.name)).toEqual(['anthropic-skills:pdf']);
+    expect(h.slashMatches(commands, 'conversation').map((c) => c.name)).toEqual(['compact']);
+    // A description counts only where one of its words starts with the query.
+    expect(h.slashMatches(commands, 'ers')).toEqual([]);
+    expect(h.slashMatches(commands, 'two').map((c) => c.name)).toEqual(['dual-review']);
+    expect(h.slashMatches(commands, 'iew').map((c) => c.name)).toEqual([
+      'code-review',
+      'dual-review',
+      'preview',
+      'review',
+      'reviewer-notes',
+    ]);
+    expect(h.slashMatches(commands, '')).toHaveLength(commands.length);
+    expect(h.slashMatches(commands, 'zzz')).toEqual([]);
+  });
+});
+
 // ─── The module in a DOM ──────────────────────────────────────────────────────
 
 type Api = ReturnType<typeof vi.fn>;
@@ -184,7 +234,9 @@ interface ChatApp {
   _chatViewHide: () => void;
   _chatViewRenderStatus: () => void;
   shouldToggleChatViewFromShortcut: (e: Partial<KeyboardEvent>) => boolean;
+  _chatViewSlashUpdate: () => void;
   _chatView: {
+    slashMenu: HTMLElement;
     root: HTMLElement;
     toggle: HTMLElement;
     thread: HTMLElement;
@@ -360,16 +412,26 @@ describe('chat view module', () => {
     expect(app._apiJson).toHaveBeenCalledWith('/api/sessions/s1/last-response?context=full');
     expect(JSON.parse(win.localStorage.getItem('codeman:chatViewModes')!)).toEqual({ s1: 'chat' });
 
-    // The per-session turn state goes with the session too.
+    // The per-session turn and command-menu state goes with the session too.
     const state = app as unknown as Record<string, Map<string, unknown> | Set<string>>;
     state._chatViewTurnStarts = new Map([['s1', 1]]);
     state._chatViewIdleSeen = new Set(['s1']);
     state._chatViewKeepAliveTurns = new Set(['s1']);
+    state._chatViewSlashCache = new Map([['s1', { commands: [] }]]);
+    state._chatViewPickerSessions = new Set(['s1']);
+    state._chatViewClearedAfter = new Map([['s1', 1]]);
 
     // A detach sends the same event as a delete, so the view choice outlives it.
     app._chatViewForget('s1');
     expect(JSON.parse(win.localStorage.getItem('codeman:chatViewModes')!)).toEqual({ s1: 'chat' });
-    for (const key of ['_chatViewTurnStarts', '_chatViewIdleSeen', '_chatViewKeepAliveTurns']) {
+    for (const key of [
+      '_chatViewTurnStarts',
+      '_chatViewIdleSeen',
+      '_chatViewKeepAliveTurns',
+      '_chatViewSlashCache',
+      '_chatViewPickerSessions',
+      '_chatViewClearedAfter',
+    ]) {
       expect(state[key].has('s1')).toBe(false);
     }
   });
@@ -466,6 +528,23 @@ describe('chat view module', () => {
 
     (nodes[0].querySelector('.chat-view-show-all') as HTMLButtonElement).click();
     expect(app._chatView.thread.children[0].textContent).toContain('log 19');
+  });
+
+  it("keeps Claude's badge on a reply that follows a `!` command's output in the same turn", async () => {
+    const messages: (Msg & { shellOutput?: boolean })[] = [
+      { role: 'user', text: 'Look at the build', turn: 1 },
+      { role: 'user', text: '!ls', turn: 1 },
+      { role: 'assistant', text: '```\nsrc\n```', turn: 1, shellOutput: true },
+      { role: 'assistant', text: 'The build is fine.', turn: 1 },
+    ];
+    const { app } = loadModule({ messages: [messages] });
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    await settle();
+    const nodes = Array.from(app._chatView.thread.children) as HTMLElement[];
+    expect(nodes).toHaveLength(4);
+    expect(nodes[2].classList.contains('rv-msg-cont')).toBe(true);
+    expect(nodes[3].classList.contains('rv-msg-cont')).toBe(false);
   });
 
   it('sends through the HTTP input route with useMux, so the server presses and verifies Enter', async () => {
@@ -1270,6 +1349,23 @@ describe('chat view module', () => {
     expect(cont.textContent).toContain('line 29');
   });
 
+  it("draws a `!` command's output without Claude's badge", () => {
+    const { app } = loadModule();
+    const a = app as unknown as {
+      _buildResponseViewerMessage: (t: string, r: string, l: string, m?: { continuation?: boolean }) => HTMLElement;
+      _chatViewBuildMessage: (m: Msg & { shellOutput?: boolean }, label: string, continuation: boolean) => HTMLElement;
+    };
+    const seen: (boolean | undefined)[] = [];
+    const build = a._buildResponseViewerMessage;
+    a._buildResponseViewerMessage = (text, role, label, meta) => {
+      seen.push(meta?.continuation);
+      return build(text, role, label, meta);
+    };
+    a._chatViewBuildMessage({ role: 'assistant', text: '```\nok\n```', turn: 1, shellOutput: true }, 'Claude', false);
+    a._chatViewBuildMessage({ role: 'assistant', text: 'A reply.', turn: 2 }, 'Claude', false);
+    expect(seen).toEqual([true, false]);
+  });
+
   it('uploads attached files and puts their paths in the message box, never in the pane', async () => {
     const { win, app } = loadModule();
     app.setChatViewMode('s1', 'chat');
@@ -1485,6 +1581,379 @@ describe('chat view module', () => {
   });
 });
 
+describe('chat view slash menu', () => {
+  const commands = [
+    { name: 'clear', description: 'Start a new session', kind: 'builtin' },
+    { name: 'code-review', description: 'Review the current diff', kind: 'skill' },
+    { name: 'compact', description: 'Free up context', kind: 'builtin' },
+  ];
+
+  async function openMenu(value: string) {
+    const loaded = loadModule();
+    const { app, win } = loaded;
+    app._apiJson.mockImplementation(async (url: string) =>
+      url.endsWith('/slash-commands') ? { commands } : { messages: [] }
+    );
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    await settle();
+    const input = app._chatView.input;
+    input.focus();
+    input.value = value;
+    input.setSelectionRange(value.length, value.length);
+    input.dispatchEvent(new win.Event('input'));
+    await settle();
+    await settle();
+    return loaded;
+  }
+
+  const key = (win: Window, input: HTMLElement, k: string, extra: Record<string, unknown> = {}) => {
+    const ev = new (win as unknown as { KeyboardEvent: typeof KeyboardEvent }).KeyboardEvent('keydown', {
+      key: k,
+      bubbles: true,
+      cancelable: true,
+      ...extra,
+    });
+    input.dispatchEvent(ev);
+    return ev;
+  };
+
+  const rows = (app: ChatApp) =>
+    Array.from(app._chatView.slashMenu.querySelectorAll('.chat-view-slash-item')).map(
+      (row) => row.querySelector('.chat-view-slash-name')!.textContent
+    );
+
+  it("reads the session's commands once and lists the ones matching what follows /", async () => {
+    const { app } = await openMenu('/c');
+    expect(app._apiJson).toHaveBeenCalledWith('/api/sessions/s1/slash-commands');
+    expect(app._chatView.slashMenu.hidden).toBe(false);
+    expect(rows(app)).toEqual(['/clear', '/code-review', '/compact']);
+    expect(app._chatView.input.getAttribute('aria-expanded')).toBe('true');
+  });
+
+  it("draws a built-in's description in the page's language and a skill's as written", async () => {
+    const { app, win } = await openMenu('/c');
+    (win as unknown as { CodemanI18n: { t(s: string): string } }).CodemanI18n = { t: (s) => `zh:${s}` };
+    app._chatView.input.dispatchEvent(new win.Event('input'));
+    await settle();
+    const descriptions = Array.from(app._chatView.slashMenu.querySelectorAll('.chat-view-slash-desc')).map(
+      (el) => el.textContent
+    );
+    expect(descriptions).toEqual(['zh:Start a new session', 'Review the current diff', 'zh:Free up context']);
+  });
+
+  it('moves with the arrows and completes with Tab, keeping the rest of the message', async () => {
+    const { app, win } = await openMenu('/co');
+    expect(rows(app)).toEqual(['/code-review', '/compact']);
+    key(win, app._chatView.input, 'ArrowDown');
+    expect(app._chatView.slashMenu.querySelector('[aria-selected="true"]')!.textContent).toContain('/compact');
+    const ev = key(win, app._chatView.input, 'Tab');
+    expect(ev.defaultPrevented).toBe(true);
+    expect(app._chatView.input.value).toBe('/compact ');
+    expect(app._chatView.slashMenu.hidden).toBe(true);
+  });
+
+  it('completes on Enter instead of sending, and sends once the word is a whole command name', async () => {
+    const { app, win } = await openMenu('/cle');
+    key(win, app._chatView.input, 'Enter');
+    expect(app._chatView.input.value).toBe('/clear ');
+    expect(app._api).not.toHaveBeenCalled();
+
+    const second = await openMenu('/clear');
+    expect(rows(second.app)[0]).toBe('/clear');
+    key(second.win, second.app._chatView.input, 'Enter');
+    await settle();
+    expect(second.app._api).toHaveBeenCalledWith('/api/sessions/s1/input', expect.anything());
+  });
+
+  it('closes on Esc, on a caret past the first word, and when nothing matches', async () => {
+    const { app, win } = await openMenu('/c');
+    key(win, app._chatView.input, 'Escape');
+    expect(app._chatView.slashMenu.hidden).toBe(true);
+
+    const typed = await openMenu('/zzz');
+    expect(typed.app._chatView.slashMenu.hidden).toBe(true);
+
+    const past = await openMenu('/clear now');
+    expect(past.app._chatView.slashMenu.hidden).toBe(true);
+  });
+
+  it('completes the row a press lands on, without taking focus from the box', async () => {
+    const { app, win } = await openMenu('/c');
+    const second = app._chatView.slashMenu.querySelectorAll('.chat-view-slash-item')[1];
+    const ev = new (win as unknown as { MouseEvent: typeof MouseEvent }).MouseEvent('mousedown', {
+      bubbles: true,
+      cancelable: true,
+    });
+    second.dispatchEvent(ev);
+    expect(ev.defaultPrevented).toBe(true);
+    expect(app._chatView.input.value).toBe('/code-review ');
+    expect(app._chatView.slashMenu.hidden).toBe(true);
+  });
+
+  it('closes the menu when Ctrl+Enter sends, so the next Enter does not complete into the empty box', async () => {
+    const { app, win } = await openMenu('/comp');
+    expect(app._chatView.slashMenu.hidden).toBe(false);
+    key(win, app._chatView.input, 'Enter', { ctrlKey: true });
+    await settle();
+    expect(app._api).toHaveBeenCalledWith('/api/sessions/s1/input', expect.anything());
+    expect(app._chatView.input.value).toBe('');
+    expect(app._chatView.slashMenu.hidden).toBe(true);
+    expect((app._chatView as unknown as { slash: unknown }).slash).toBeNull();
+
+    key(win, app._chatView.input, 'Enter');
+    await settle();
+    expect(app._chatView.input.value).toBe('');
+  });
+
+  it('keeps a menu closed with Esc closed when a command read already in flight lands', async () => {
+    const { app, win } = await openMenu('/co');
+    const cache = (app as unknown as { _chatViewSlashCache: Map<string, { at: number }> })._chatViewSlashCache;
+    cache.get('s1')!.at = 0;
+    let resolveRead: (value: unknown) => void = () => {};
+    app._apiJson.mockImplementation((url: string) =>
+      url.endsWith('/slash-commands')
+        ? new Promise((resolve) => {
+            resolveRead = resolve;
+          })
+        : Promise.resolve({ messages: [] })
+    );
+
+    const input = app._chatView.input;
+    input.dispatchEvent(new win.Event('input'));
+    // The stale list draws at once while the new read is pending.
+    expect(app._chatView.slashMenu.hidden).toBe(false);
+    key(win, input, 'Escape');
+    expect(app._chatView.slashMenu.hidden).toBe(true);
+
+    resolveRead({ commands });
+    await settle();
+    await settle();
+    expect(app._chatView.slashMenu.hidden).toBe(true);
+  });
+  it('draws the menu again when a command read lands after the user typed past an Esc', async () => {
+    const { app, win } = await openMenu('/co');
+    const input = app._chatView.input;
+    key(win, input, 'Escape');
+    expect(app._chatView.slashMenu.hidden).toBe(true);
+    // Nothing cached: the menu waits for the read the next keystroke starts.
+    (app as unknown as { _chatViewSlashCache: Map<string, unknown> })._chatViewSlashCache.delete('s1');
+    let resolveRead: (value: unknown) => void = () => {};
+    app._apiJson.mockImplementation((url: string) =>
+      url.endsWith('/slash-commands')
+        ? new Promise((resolve) => {
+            resolveRead = resolve;
+          })
+        : Promise.resolve({ messages: [] })
+    );
+
+    input.value = '/c';
+    input.setSelectionRange(2, 2);
+    input.dispatchEvent(new win.Event('input'));
+    expect(app._chatView.slashMenu.hidden).toBe(true);
+
+    resolveRead({ commands });
+    await settle();
+    await settle();
+    expect(app._chatView.slashMenu.hidden).toBe(false);
+    expect((app._chatView as unknown as { slash: unknown }).slash).not.toBeNull();
+  });
+
+  it("ends an Esc dismissal at a session switch, so the other session's menu draws when its read lands", async () => {
+    const { app, win } = await openMenu('/co');
+    key(win, app._chatView.input, 'Escape');
+    expect(app._chatView.slashMenu.hidden).toBe(true);
+    let resolveRead: (value: unknown) => void = () => {};
+    app._apiJson.mockImplementation((url: string) =>
+      url.endsWith('/slash-commands')
+        ? new Promise((resolve) => {
+            resolveRead = resolve;
+          })
+        : Promise.resolve({ messages: [] })
+    );
+
+    // s5 has no cached list, and its draft comes back without an input event.
+    (app as unknown as { _chatViewDrafts: () => Map<string, string> })._chatViewDrafts().set('s5', '/co');
+    app.setChatViewMode('s5', 'chat');
+    app.activeSessionId = 's5';
+    app.onChatViewActiveSession('s5');
+    const input = app._chatView.input;
+    expect(input.value).toBe('/co');
+    input.focus();
+    input.setSelectionRange(3, 3);
+    // A click on the restored draft starts the read.
+    input.dispatchEvent(
+      new (win as unknown as { MouseEvent: typeof MouseEvent }).MouseEvent('click', { bubbles: true })
+    );
+    expect(app._apiJson).toHaveBeenCalledWith('/api/sessions/s5/slash-commands');
+    expect(app._chatView.slashMenu.hidden).toBe(true);
+
+    resolveRead({ commands });
+    await settle();
+    await settle();
+    expect(app._chatView.slashMenu.hidden).toBe(false);
+    expect(rows(app)).toEqual(['/code-review', '/compact']);
+  });
+});
+
+describe('chat view slash commands that do more than send', () => {
+  const h = loadHelpers();
+  const slashReads = (app: ChatApp) =>
+    app._apiJson.mock.calls.filter(([url]) => String(url).endsWith('/slash-commands')).length;
+  const pickerSessions = (app: ChatApp) =>
+    (app as unknown as { _chatViewPickerSessions?: Set<string> })._chatViewPickerSessions;
+
+  it('tells /quit, /exit, /clear and other bare commands apart, and leaves commands with arguments alone', () => {
+    expect(h.slashIntent(' /quit ')).toEqual({ kind: 'close', name: 'quit' });
+    expect(h.slashIntent('/exit')).toEqual({ kind: 'close', name: 'exit' });
+    expect(h.slashIntent('/clear')).toEqual({ kind: 'clear', name: 'clear' });
+    expect(h.slashIntent('/model')).toEqual({ kind: 'bare', name: 'model' });
+    expect(h.slashIntent('/model opus')).toBeNull();
+    expect(h.slashIntent('quit')).toBeNull();
+    expect(h.slashIntent('/quit now')).toBeNull();
+  });
+
+  it('closes the session at once for /quit, the way the close button does, and sends nothing', async () => {
+    const { app } = loadModule();
+    const close = vi.fn(async () => true);
+    (app as unknown as { closeSession: typeof close }).closeSession = close;
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    app._chatView.input.value = '/quit';
+    await app._chatViewSend();
+    expect(close).toHaveBeenCalledWith('s1', true);
+    expect(app._api).not.toHaveBeenCalled();
+    expect(app._chatView.input.value).toBe('');
+  });
+
+  it('empties the thread on /clear and keeps the old conversation out until the server moves on', async () => {
+    const old: Msg[] = [
+      { role: 'user', text: 'old prompt', turn: 1, timestamp: '2026-11-25T08:00:00Z' } as Msg,
+      { role: 'assistant', text: 'old answer', turn: 1, timestamp: '2026-11-25T08:00:05Z' } as Msg,
+    ];
+    const fresh: Msg[] = [{ role: 'user', text: 'new prompt', turn: 1, timestamp: '2026-11-25T08:01:00Z' } as Msg];
+    const { app } = loadModule({ messages: [old, old, fresh] });
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    await settle();
+    expect(app._chatView.thread.textContent).toContain('old answer');
+
+    app._chatView.input.value = '/clear';
+    await app._chatViewSend();
+    expect(app._api).toHaveBeenCalledWith('/api/sessions/s1/input', expect.anything());
+    expect(app._chatView.thread.textContent).toBe('');
+
+    // The server still reads the old conversation: nothing of it comes back.
+    await app._chatViewFetch();
+    expect(app._chatView.thread.textContent).toBe('');
+    // The next prompt is the new conversation's, and it shows.
+    await app._chatViewFetch();
+    expect(app._chatView.thread.textContent).toContain('new prompt');
+  });
+
+  it('shows the terminal for a bare picker command without changing the remembered choice', async () => {
+    const { app, win } = loadModule();
+    app._apiJson.mockImplementation(async (url: string) =>
+      url.endsWith('/slash-commands')
+        ? {
+            commands: [
+              { name: 'model', description: '', kind: 'builtin', opensTerminal: true },
+              { name: 'recap', description: '', kind: 'builtin' },
+            ],
+          }
+        : { messages: [] }
+    );
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    await settle();
+
+    app._chatView.input.value = '/recap';
+    await app._chatViewSend();
+    await settle();
+    expect(app.chatViewModeFor('s1')).toBe('chat');
+    // The picker waits for the cache's own read and issues none of its own.
+    const reads = () => app._apiJson.mock.calls.filter(([url]) => String(url).endsWith('/slash-commands')).length;
+    expect(reads()).toBe(1);
+
+    app._chatView.input.value = '/model';
+    await app._chatViewSend();
+    await settle();
+    expect(app.chatViewModeFor('s1')).toBe('terminal');
+    expect(reads()).toBe(1);
+    expect(app._chatView.root.hidden).toBe(true);
+    expect(JSON.parse(win.localStorage.getItem('codeman:chatViewModes')!)).toEqual({ s1: 'chat' });
+    expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('/model opens in the terminal'), 'info');
+
+    // Switching back ends it.
+    app.setChatViewMode('s1', 'chat');
+    expect(app.chatViewModeFor('s1')).toBe('chat');
+  });
+
+  it('waits for the command read in flight before a first bare picker command decides', async () => {
+    const { app } = loadModule();
+    let resolveRead: (value: unknown) => void = () => {};
+    app._apiJson.mockImplementation((url: string) =>
+      url.endsWith('/slash-commands')
+        ? new Promise((resolve) => {
+            resolveRead = resolve;
+          })
+        : Promise.resolve({ messages: [] })
+    );
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    await settle();
+
+    app._chatView.input.value = '/model';
+    await app._chatViewSend();
+    await settle();
+    // The prompt went out, and the picker still waits for the list.
+    expect(app._api).toHaveBeenCalledWith('/api/sessions/s1/input', expect.anything());
+    expect(app._chatView.root.hidden).toBe(false);
+
+    resolveRead({ commands: [{ name: 'model', description: '', kind: 'builtin', opensTerminal: true }] });
+    await settle();
+    await settle();
+    expect(pickerSessions(app)?.has('s1')).toBe(true);
+    expect(app._chatView.root.hidden).toBe(true);
+    expect(slashReads(app)).toBe(1);
+  });
+
+  it('reads the command list again for a bare picker command sent soon after a failed read', async () => {
+    const { app } = loadModule();
+    let failed = false;
+    app._apiJson.mockImplementation(async (url: string) => {
+      if (!url.endsWith('/slash-commands')) return { messages: [] };
+      // _apiJson answers null for a network error or a status that is not ok.
+      if (!failed) {
+        failed = true;
+        return null;
+      }
+      return {
+        commands: [
+          { name: 'model', description: '', kind: 'builtin', opensTerminal: true },
+          { name: 'recap', description: '', kind: 'builtin' },
+        ],
+      };
+    });
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    await settle();
+
+    app._chatView.input.value = '/recap';
+    await app._chatViewSend();
+    await settle();
+    expect(slashReads(app)).toBe(1);
+    expect(pickerSessions(app)?.has('s1')).toBeFalsy();
+
+    app._chatView.input.value = '/model';
+    await app._chatViewSend();
+    await settle();
+    expect(slashReads(app)).toBe(2);
+    expect(pickerSessions(app)?.has('s1')).toBe(true);
+    expect(app._chatView.root.hidden).toBe(true);
+  });
+});
+
 describe('chat view wiring', () => {
   it("swallows the toggle chord in the xterm key handler and in Pane B's", () => {
     const terminalUi = read('terminal-ui.js');
@@ -1543,6 +2012,14 @@ describe('chat view wiring', () => {
     expect(settings).toMatch(/this\._chatViewSync\?\.\(\);/);
     const html = read('index.html');
     expect(html).toContain('id="appSettingsShowChatViewSwitch"');
+  });
+
+  it("lets Escape in the message box close only the / menu, ahead of the global handler's closes", () => {
+    const app = read('app.js');
+    const escape = app.slice(app.indexOf("if (e.key === 'Escape') {"), app.indexOf('this.closeAllPanels();'));
+    expect(escape).toMatch(
+      /if \(e\.target\?\.classList\?\.contains\('chat-view-input'\) && this\._chatView\?\.slash\) \{\s*this\._chatViewSlashClose\(\);\s*return;/
+    );
   });
 
   it('passes the keep-alive flag of session:working and session:idle to the chat view', () => {

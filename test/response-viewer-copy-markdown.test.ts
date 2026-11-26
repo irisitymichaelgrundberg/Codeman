@@ -150,6 +150,25 @@ describe('what Copy Markdown copies', () => {
     expect(app._copyText).toHaveBeenCalledWith('part one\n\npart two');
   });
 
+  it("copies Claude's last answer, never a later `!` command's output", async () => {
+    mountViewer();
+    const app = makeApp(
+      { text: 'stale brief answer' },
+      {
+        messages: [
+          { role: 'user', text: 'first', turn: 1 },
+          { role: 'assistant', text: 'the answer', turn: 1 },
+          { role: 'user', text: '!ls', turn: 2 },
+          { role: 'assistant', text: '```\nsrc\n```', turn: 2, shellOutput: true },
+        ],
+      }
+    );
+    await app.toggleResponseViewer();
+    await app.loadFullContext();
+    await app.copyResponseViewerMarkdown();
+    expect(app._copyText).toHaveBeenCalledWith('the answer');
+  });
+
   it('copies only the last response block when blocks have no turns, never a tool or status block', async () => {
     mountViewer();
     const app = makeApp(

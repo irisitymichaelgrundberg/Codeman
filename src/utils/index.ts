@@ -28,7 +28,7 @@ export { MAX_SESSION_TOKENS } from './token-validation.js';
 export { isSafePushEndpoint } from './push-endpoint-validation.js';
 export { stringSimilarity, fuzzyPhraseMatch, todoContentHash } from './string-similarity.js';
 export { assertNever } from './type-safety.js';
-export { toSingleLine } from './single-line.js';
+export { oneLineText, toSingleLine } from './single-line.js';
 export { wrapWithNice } from './nice-wrapper.js';
 export { resolveLocalShell, loginShellArgs } from './shell-resolver.js';
 export { getAugmentedPath, getClaudeCliVersion, getClaudeBinaryPath } from './claude-cli-resolver.js';

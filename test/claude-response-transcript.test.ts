@@ -195,6 +195,27 @@ describe('ClaudeTranscriptReader', () => {
     expect((await second).text).toBe('late');
   });
 
+  it("follows the skill listings and keeps a clone's skills apart", async () => {
+    const listing = (names: string[], isInitial: boolean) =>
+      JSON.stringify({
+        type: 'attachment',
+        attachment: {
+          type: 'skill_listing',
+          names,
+          content: names.map((n) => `- ${n}: about ${n}`).join('\n'),
+          isInitial,
+        },
+      });
+    writeFileSync(file, `${listing(['one'], true)}\n`);
+    const reader = new ClaudeTranscriptReader();
+    expect((await reader.read(file)).skills.map((c) => c.name)).toEqual(['one']);
+    // An unfinished last line is parsed on a copy, and the next read parses it for good.
+    appendFileSync(file, listing(['two'], false));
+    expect((await reader.read(file)).skills.map((c) => c.name)).toEqual(['one', 'two']);
+    appendFileSync(file, `\n${listing(['three'], true)}\n`);
+    expect((await reader.read(file)).skills).toEqual([{ name: 'three', description: 'about three', kind: 'skill' }]);
+  });
+
   it('rejects for a missing file, and reads it once it exists', async () => {
     const reader = new ClaudeTranscriptReader();
     await expect(reader.read(file)).rejects.toThrow();

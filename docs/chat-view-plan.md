@@ -188,6 +188,9 @@ The box also gets these controls:
   skill's row arrives as its turn starts, followed at once by the hidden body row,
   and that row takes the sent copy's place then. A command that runs no turn and is
   never recorded goes from the thread after four seconds.
+- A shell command typed with `!` shows as typed (`!git status`), with its output
+  under it as a code block that carries no badge of Claude's. Claude Code records the
+  command without its `!` and the output in a row of its own.
 - Some slash commands typed with nothing after them get special handling in the chat view:
   - `/quit` and `/exit` close the session at once, as the tab's close button does,
     rather than waiting for the agent to exit and the server to notice.
@@ -313,8 +316,8 @@ is off.
       your answer in the terminal" notice with its switch button, and follow `/clear`
       through the statusline. Typing still happens in the terminal.
    2. **Write.** Add the message box with send, stop and attach.
-   3. **Slash commands.** Add the `/` menu, draw a typed slash command as typed, and
-      handle `/clear`, `/quit`, `/exit` and the picker commands.
+   3. **Slash commands.** Add the `/` menu, draw a typed slash or `!` command as
+      typed, and handle `/clear`, `/quit`, `/exit` and the picker commands.
    4. **What Claude is doing.** Name the running tool in the status line, say when
       Claude compacts or still runs background work, and show the suggested next
       prompt as the message box's placeholder.
