@@ -24346,6 +24346,50 @@ body.keyboard-visible .terminal-container .xterm-screen {
   outline-offset: 2px;
 }
 
+/* The CLI's statusline, under the message box. Its colours are mapped onto the skin's own
+   tokens (CodemanChatView.statusLineSegments), never the terminal's ANSI palette. */
+.chat-view-statusline {
+  width: calc(100% - 32px);
+  max-width: 820px;
+  margin: -6px auto 10px;
+  padding-inline: 14px;
+  color: var(--text-muted);
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, 'Symbols Nerd Font Mono', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.chat-view-statusline[hidden] {
+  display: none;
+}
+
+/* Wraps rather than cuts: a long folder path at its start must not push the usage figures
+   that follow it out of sight. */
+.chat-view-statusline-row {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chat-view-statusline .sl-red { color: var(--red); }
+.chat-view-statusline .sl-green { color: var(--green); }
+.chat-view-statusline .sl-yellow { color: var(--yellow); }
+.chat-view-statusline .sl-blue { color: var(--accent); }
+.chat-view-statusline .sl-cyan { color: var(--teal); }
+.chat-view-statusline .sl-magenta { color: color-mix(in srgb, var(--accent) 50%, var(--red)); }
+.chat-view-statusline .sl-muted { color: var(--text-muted); }
+.chat-view-statusline .sl-bold { font-weight: 700; }
+.chat-view-statusline .sl-dim { opacity: 0.7; }
+
+/* The light skins' yellow and green are made for fills, not small text: darken them a step,
+   as --notice-ink does for the security notice. */
+html:is([data-skin="paper-gray"], [data-skin="solarized-light"], [data-skin="catppuccin-latte"], [data-skin="rose-pine-dawn"]) .chat-view-statusline .sl-yellow {
+  color: color-mix(in srgb, var(--yellow) 70%, black);
+}
+
+html:is([data-skin="paper-gray"], [data-skin="solarized-light"], [data-skin="catppuccin-latte"], [data-skin="rose-pine-dawn"]) .chat-view-statusline .sl-green {
+  color: color-mix(in srgb, var(--green) 80%, black);
+}
+
 /* Chat / Terminal switch: top right of the session area, above both views. */
 .chat-view-toggle {
   position: absolute;

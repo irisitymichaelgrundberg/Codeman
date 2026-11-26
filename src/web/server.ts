@@ -114,6 +114,7 @@ import {
   readGitFetchSettings,
   readKeepWarmSettingsOrThrow,
   readPlanUsageTelemetryEnabled,
+  refreshStatusLineExporterScriptIfPresent,
   removeAgentSessionPreamble,
 } from '../hooks-config.js';
 import { PushSubscriptionStore } from '../push-store.js';
@@ -3584,6 +3585,16 @@ export class WebServer extends EventEmitter {
       this._settingsCache = null;
     }
 
+    // Sessions that outlived the restart run the statusline exporter script on every render, so
+    // bring an existing copy up to this build's version now (hooks-config.ts).
+    if (!this.testMode) {
+      try {
+        await refreshStatusLineExporterScriptIfPresent();
+      } catch {
+        // Unwritable: the next launch that needs the script writes it.
+      }
+    }
+
     // Restore mux sessions BEFORE accepting connections
     // This prevents race conditions where clients connect before state is ready
     // CRITICAL: Skip in test mode to prevent tests from picking up user sessions
@@ -4336,6 +4347,9 @@ export class WebServer extends EventEmitter {
               // Session Options readout would read "not reported yet" after every restart. The
               // readout is time-aware, so a value past its expiry shows as cold, not stale-warm.
               promptCache: savedState?.promptCache,
+              // The last statusline text, restored for the same reason, so the chat view
+              // shows it until the session's next statusline report replaces it.
+              statusLine: savedState?.statusLine,
               // A record rebuilt from the socket has no provenance, so its
               // apparent locality is a guess (see `MuxSession.discovered`).
               discoveredMuxSession: muxSession.discovered,

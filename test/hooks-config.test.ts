@@ -21,6 +21,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { SETTINGS_PATH } from '../src/web/route-helpers.js';
+import { dataPath } from '../src/config/instance.js';
 import { tmpdir, homedir } from 'node:os';
 import { spawn } from 'node:child_process';
 import {
@@ -34,6 +35,7 @@ import {
   generateSubagentStopGuardScript,
   readPlanUsageTelemetryEnabled,
   refreshStaleCodemanHooks,
+  refreshStatusLineExporterScriptIfPresent,
   resolveStatusLineCliCommand,
   settingsWriteBlocker,
   stripCaseEnvKeys,
@@ -1415,6 +1417,21 @@ describe('resolveStatusLineCliCommand', () => {
     expect(siblings).toEqual([]);
   });
 
+  it('the boot refresh leaves a missing exporter script missing', async () => {
+    const scriptPath = dataPath('statusline-exporter.sh');
+    rmSync(scriptPath, { force: true });
+    expect(await refreshStatusLineExporterScriptIfPresent()).toBe(false);
+    expect(existsSync(scriptPath)).toBe(false);
+  });
+
+  it('the boot refresh brings an outdated exporter script up to this build', async () => {
+    const scriptPath = dataPath('statusline-exporter.sh');
+    mkdirSync(join(scriptPath, '..'), { recursive: true });
+    writeFileSync(scriptPath, '#!/bin/sh\n# CODEMAN_STATUSLINE_EXPORTER_V0\necho stale\n');
+    expect(await refreshStatusLineExporterScriptIfPresent()).toBe(true);
+    expect(readFileSync(scriptPath, 'utf-8')).toContain('CODEMAN_STATUSLINE_EXPORTER_V5');
+  });
+
   it('survives concurrent refreshes in the same millisecond (sessions created at once)', async () => {
     const scriptPath = (await resolveStatusLineCliCommand(testDir, true))!;
     writeFileSync(scriptPath, '#!/bin/sh\n# CODEMAN_STATUSLINE_EXPORTER_V0\necho stale\n');
@@ -1551,6 +1568,78 @@ describe('statusline exporter script (real shell execution)', () => {
     const result = await runExporter({ ...baseEnv, CODEMAN_USER_STATUSLINE_CMD: 'echo my-own-statusline' });
     expect(result.stdout.trim()).toBe('my-own-statusline');
     expect(result.durationMs).toBeLessThan(1000);
+  }, 10000);
+
+  interface ExporterPost {
+    sessionId: string;
+    wrapped?: boolean;
+    rendered?: string;
+    data?: unknown;
+  }
+
+  // writeRecordingCurl installs a fake curl that saves each body it is sent to its own file, and
+  // collectPosts returns one session's posts once they all landed. The posts come from background
+  // subshells, so the test waits for them. An earlier test's late background post can land here
+  // too, and the session id filters it out.
+  const postsDir = () => join(binDir, 'posts');
+  function writeRecordingCurl(): void {
+    mkdirSync(postsDir(), { recursive: true });
+    writeFakeCurl(`cat > "$(mktemp '${postsDir()}/post.XXXXXX')"`);
+  }
+  async function collectPosts(sessionId: string, count: number): Promise<ExporterPost[]> {
+    let posts: ExporterPost[] = [];
+    for (let i = 0; i < 100; i++) {
+      const bodies = readdirSync(postsDir()).map((f) => readFileSync(join(postsDir(), f), 'utf-8'));
+      if (bodies.every((b) => b.endsWith('}'))) {
+        posts = bodies.map((b) => JSON.parse(b) as ExporterPost).filter((p) => p.sessionId === sessionId);
+        if (posts.length >= count) break;
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return posts;
+  }
+
+  it("wrap branch: prints the user's output unchanged, keeps its exit status, and posts the telemetry and a base64 copy apart", async () => {
+    writeRecordingCurl();
+    const userCmd = "printf '\\033[36m/work\\033[0m ctx: 5%%'; exit 3";
+    const env = { ...baseEnv, CODEMAN_SESSION_ID: 'wrap-copy', CODEMAN_USER_STATUSLINE_CMD: userCmd };
+    const result = await runExporter(env);
+    expect(result.stdout).toBe('\u001b[36m/work\u001b[0m ctx: 5%');
+    expect(result.code).toBe(3);
+    const posts = await collectPosts('wrap-copy', 2);
+    expect(posts).toHaveLength(2);
+    // The telemetry post is marked as wrapped and carries no copy of the output.
+    const telemetry = posts.find((p) => p.data !== undefined)!;
+    expect(telemetry).toEqual({ sessionId: 'wrap-copy', wrapped: true, data: {} });
+    // The copy goes on its own, with no telemetry.
+    const copy = posts.find((p) => p.rendered !== undefined)!;
+    expect(copy.data).toBeUndefined();
+    expect(Buffer.from(copy.rendered!, 'base64').toString('utf8')).toBe('\u001b[36m/work\u001b[0m ctx: 5%');
+  }, 10000);
+
+  it('wrap branch: prints all of a long output, and cuts the posted copy to 4 KiB', async () => {
+    writeRecordingCurl();
+    const userCmd = "head -c 7000 /dev/zero | tr '\\0' a";
+    const env = { ...baseEnv, CODEMAN_SESSION_ID: 'wrap-long', CODEMAN_USER_STATUSLINE_CMD: userCmd };
+    const result = await runExporter(env);
+    expect(result.stdout).toBe('a'.repeat(7000));
+    const copy = (await collectPosts('wrap-long', 2)).find((p) => p.rendered !== undefined)!;
+    expect(Buffer.from(copy.rendered!, 'base64')).toHaveLength(4096);
+    expect(copy.rendered!.length).toBeLessThan(8192);
+  }, 10000);
+
+  it("wrap branch: starts the telemetry post before the user's command runs", async () => {
+    writeRecordingCurl();
+    // The user's command waits, bounded, for the telemetry post to land, then prints how many
+    // posts carry this session's id. The rendered copy is posted only after the command ends,
+    // so a telemetry post that starts first makes it print 1. Filtering on the session id
+    // keeps a late post of an earlier test from counting.
+    const dir = postsDir();
+    const userCmd = `i=0; while [ $i -lt 40 ] && [ -z "$(grep -l wrap-early '${dir}'/post.* 2>/dev/null)" ]; do sleep 0.05; i=$((i+1)); done; grep -l wrap-early '${dir}'/post.* 2>/dev/null | wc -l | tr -d ' '`;
+    const env = { ...baseEnv, CODEMAN_SESSION_ID: 'wrap-early', CODEMAN_USER_STATUSLINE_CMD: userCmd };
+    const result = await runExporter(env);
+    expect(result.stdout).toBe('1');
+    await collectPosts('wrap-early', 2);
   }, 10000);
 
   it('curl is bounded with --max-time so a HUNG (not just refused) Codeman cannot wedge the render', async () => {

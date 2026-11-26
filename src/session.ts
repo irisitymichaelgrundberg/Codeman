@@ -175,6 +175,7 @@ import {
   type ReportedModel,
   type ReportedModelSource,
 } from './session-display-model.js';
+import { sanitizeStatusLineText } from './statusline-text.js';
 
 export type { BackgroundTask } from './task-tracker.js';
 export type { RalphTrackerState, RalphTodoItem, ActiveBashTool } from './types.js';
@@ -663,6 +664,8 @@ export class Session extends EventEmitter {
   private _watching: string | null = null;
   /** Last `prompt_cache` report from the statusline exporter; null until Claude sends one. */
   private _promptCache: PromptCacheStatus | null = null;
+  /** The statusline's text, for the chat view (see SessionState.statusLine). Restored after a restart. */
+  private _statusLine = '';
   /** The CLI's suggested next prompt, for the chat view (see SessionState.promptSuggestion). Runtime only. */
   private _promptSuggestion = '';
   private _contextReport: ContextReport | null = null;
@@ -1026,6 +1029,8 @@ export class Session extends EventEmitter {
       displayModel?: DisplayModel;
       /** The previous run's last prompt-cache report, restored so the readout is not blank (see `promptCache`). */
       promptCache?: PromptCacheStatus;
+      /** The previous run's statusline text, restored so the chat view is not blank (see `statusLine`). */
+      statusLine?: string;
       /** This session was rebuilt from the tmux socket, so its metadata is a guess. */
       discoveredMuxSession?: boolean;
       /** Restored wall-clock ms of the pane's last output (recovery only; see `_wireActivityAt`). */
@@ -1229,6 +1234,11 @@ export class Session extends EventEmitter {
     // has passed renders as cold rather than stale-warm. Set directly, not via
     // setPromptCache, so recovery does not re-stamp a compaction it did not just observe.
     this._promptCache = config.promptCache ?? null;
+    // Last statusline text, restored for the same reason: an idle claude session runs its
+    // statusline command again only on its next turn or when its prompt cache expires, so the
+    // chat view would show none until then. Sanitized again, because state.json is a file
+    // anyone with the account can edit.
+    this._statusLine = typeof config.statusLine === 'string' ? sanitizeStatusLineText(config.statusLine) : '';
     // Never self-parent: a session pointing at itself would draw a zero-length
     // lineage arc under its own tab. Only reachable via the recovery path, where
     // both the id and the saved parent come from disk.
@@ -1794,6 +1804,18 @@ export class Session extends EventEmitter {
    */
   get promptCache(): PromptCacheStatus | null {
     return this._promptCache;
+  }
+
+  /** What the CLI's statusline shows, already sanitized (statusline-text.ts); '' when unknown. */
+  get statusLine(): string {
+    return this._statusLine;
+  }
+
+  /** Replace the statusline text; true when it changed (the caller broadcasts only a change). */
+  setStatusLine(text: string): boolean {
+    if (text === this._statusLine) return false;
+    this._statusLine = text;
+    return true;
   }
 
   /** The suggested next prompt read off the pane (prompt-suggestion-reader.ts); '' when none. */
@@ -2505,6 +2527,13 @@ export class Session extends EventEmitter {
       advisorModel: this._advisorModel,
       customModel: this.customModel,
       displayModel: this.displayModel,
+      // Publish it only while the current launch can report one. A launch without the exporter
+      // would otherwise keep the last report's text forever, in state.json too. An unknown
+      // exporter (no mux record yet) keeps it, so a restored value still shows.
+      statusLine:
+        this.statusLineExporter === undefined || this.statusLineExporter === 'injected'
+          ? this._statusLine || undefined
+          : undefined,
       promptSuggestion: this._promptSuggestion || undefined,
       // COD-118: runtime-only — surfaced so the frontend can require explicit user
       // intent before restarting a crash-looped session. Deliberately NOT restored

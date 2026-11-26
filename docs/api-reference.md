@@ -1231,11 +1231,28 @@ is stored as the window, and Session Options stops its two inputs there. The thr
 themselves are compared with the report's `context_window.total_input_tokens`, cache reads
 included, and with the session's token counter for a launch without the exporter.
 
-## Chat view state (`promptSuggestion`)
+## Chat view state (`statusLine`, `promptSuggestion`)
 
-One more optional field of session state (`GET /api/v1/sessions`, `session:updated`)
-feeds the chat view. It is written to `state.json` with the rest of the session state but
-never read back, and it is untrusted display text that a client must render as text.
+Two more optional fields of session state (`GET /api/v1/sessions`, `session:updated`)
+feed the chat view. Both are written to `state.json` with the rest of the session
+state. After a server restart, `statusLine` is restored until the session's next report
+replaces it, because an idle Claude session runs its statusline command again only on its
+next turn or when its prompt cache expires. `promptSuggestion` is never read back. `statusLine` and `promptSuggestion` are
+untrusted display text that a client must render as text.
+
+`statusLine` is what the CLI's statusline shows under its composer, for a CLI that
+reports statusline telemetry (Claude). When the user has a statusline command of their
+own in `~/.claude/settings.json` or the project's `.claude/settings.json`, the exporter
+prints its output unchanged and posts a base64 copy of it as `rendered`. The server keeps
+that copy's text, line breaks and SGR colour sequences, and strips every other escape and
+control character. The text is at most 4 lines. Without a statusline of their own, the
+field holds Codeman's own footer, which is the statusline then. A statusline set in the
+workspace's `.claude/settings.local.json` runs without the exporter (`statusLineExporter`
+is `workspace-statusline`), so the field is absent for that launch. It is absent until the
+first report, whenever the statusline shows nothing, and while the launch is known to carry
+no exporter (`statusLineExporter` is present and other than `injected`). While
+`statusLineExporter` is absent, a restored value still shows. The change-only `session:statusLine`
+event carries each new value (`{ sessionId, text }`).
 
 `promptSuggestion` is the next prompt Claude Code suggests in its empty composer. Claude
 Code draws it faint and writes it nowhere else, so the server reads it off the pane at
@@ -1991,7 +2008,8 @@ stream; lifecycle/metadata events are delivered to all clients regardless.
 
 ### Events the chat view reads
 
-The server broadcasts these for a session whose transcript watcher runs:
+The server broadcasts these for a session whose transcript watcher runs, or whose
+statusline reports:
 
 - `transcript:update` (`{ sessionId, timestamp }`) says new lines arrived in the
   session's transcript. The server throttles it to one per 750 ms per session. The first
@@ -2006,6 +2024,8 @@ The server broadcasts these for a session whose transcript watcher runs:
   render them as text.
 - `transcript:tool_end` (`{ sessionId, toolName, isError, timestamp }`) says a tool call
   finished. The chat view then stops naming that tool.
+- `session:statusLine` (`{ sessionId, text }`) carries a changed `statusLine` value, as
+  described under [Chat view state](#chat-view-state-statusline-promptsuggestion).
 
 The chat view also re-reads the conversation on `session:working` and `session:idle`, and
 takes `promptSuggestion` from `session:updated`.

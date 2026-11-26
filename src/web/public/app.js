@@ -294,6 +294,7 @@ const _SSE_HANDLER_MAP = [
   // running tool. Turn starts and ends reach it from _onSessionWorking / _onSessionIdle.
   [SSE_EVENTS.TRANSCRIPT_UPDATE, '_onChatViewTranscriptUpdate'],
   [SSE_EVENTS.TRANSCRIPT_TOOL_START, '_onChatViewToolStart'],
+  [SSE_EVENTS.SESSION_STATUS_LINE, '_onChatViewStatusLine'],
 
   // Tunnel
   [SSE_EVENTS.TUNNEL_STARTED, '_onTunnelStarted'],

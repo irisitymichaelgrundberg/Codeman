@@ -27,7 +27,8 @@ import {
   telemetrySignature,
   type RawStatuslinePayload,
 } from '../../usage-telemetry.js';
-import { SessionPromptCache, SessionStatusTelemetry } from '../sse-events.js';
+import { SessionPromptCache, SessionStatusLine, SessionStatusTelemetry } from '../sse-events.js';
+import { decodeRenderedStatusLine, sanitizeStatusLineText } from '../../statusline-text.js';
 import { setLatestPlanUsage } from '../plan-usage-latest.js';
 import type { SessionPort, EventPort, KeepWarmPort, ConfigPort } from '../ports/index.js';
 import { noteClaudeConversationReport } from '../claude-conversation-report.js';
@@ -42,7 +43,7 @@ export function registerStatusTelemetryRoutes(
   const lastSig = new Map<string, string>();
 
   app.post('/api/status-telemetry', async (req, reply) => {
-    const { sessionId, data } = parseBody(StatusTelemetrySchema, req.body);
+    const { sessionId, data, rendered, wrapped } = parseBody(StatusTelemetrySchema, req.body);
 
     reply.type('text/plain; charset=utf-8');
 
@@ -61,6 +62,23 @@ export function registerStatusTelemetryRoutes(
     // whether the exporter is injected at all, in tmux-manager._resolveStatusLine).
     const session = ctx.sessions.get(sessionId);
     const reportsStatusLine = !!session && !!getCli(session.mode)?.capabilities.statusLineTelemetry;
+
+    // What the statusline shows, for the chat view. Broadcast only a change, because the
+    // statusline renders on every message, and persisted on change, like a model change, so a
+    // crash restores the latest report.
+    const noteStatusLine = (text: string): void => {
+      if (!session?.setStatusLine(text)) return;
+      ctx.broadcast(SessionStatusLine, { sessionId, text: session.statusLine });
+      ctx.persistSessionState(session);
+    };
+
+    // The exporter's wrap branch posts the user's own statusline output (`rendered`) on its own,
+    // after their command ran. That post carries no telemetry, so it touches nothing else: no
+    // model, conversation, context, prompt-cache or plan-usage state.
+    if (rendered !== undefined && data === undefined) {
+      if (session && reportsStatusLine) noteStatusLine(decodeRenderedStatusLine(rendered));
+      return '';
+    }
 
     // The model the CLI says it is running, for the session headers (displayModel). It
     // rides every render, so it follows an in-session `/model`; the session dedupes and
@@ -126,6 +144,13 @@ export function registerStatusTelemetryRoutes(
     // In-terminal statusline footer → CURRENT SESSION status (model / tokens /
     // context %), NOT the plan limits. Available from the first render, even
     // before rate_limits appears.
-    return formatSessionStatusText(parseSessionStatus(payload));
+    const footer = formatSessionStatusText(parseSessionStatus(payload));
+
+    // Without a statusline of the user's, this footer IS the statusline. A wrapped post comes
+    // from a pane whose own command prints the statusline (its output arrives in the separate
+    // `rendered` post), so recording the footer there would make the chat view flicker between
+    // the two.
+    if (session && reportsStatusLine && !wrapped) noteStatusLine(sanitizeStatusLineText(footer));
+    return footer;
   });
 }

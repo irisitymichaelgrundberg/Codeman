@@ -41,6 +41,7 @@ interface ChatHelpers {
   activity: (tool?: string, detail?: string, workingDir?: string, command?: string) => string;
   elapsed: (ms: number) => string;
   compacting: (rows: unknown) => boolean;
+  statusLineSegments: (text: string) => { text: string; color: string; bold: boolean; dim: boolean }[][];
   enterSends: (ev: Record<string, unknown>, touch: boolean) => boolean;
   sendPayload: (v: string) => string | null;
   slashQuery: (value: string, caret?: number) => string | null;
@@ -163,6 +164,40 @@ describe('CodemanChatView helpers', () => {
     expect(h.activity('SomethingNew', '', '/w')).toBe('SomethingNew');
     // A described command: the description alone, as the CLI's headline.
     expect(h.activity('Bash', 'Listing changes', '/w', 'git diff')).toBe('Listing changes');
+  });
+
+  it('turns a statusline into styled segments, mapping colours to names and dropping extended ones', () => {
+    const lines = h.statusLineSegments(
+      '\u001b[36m/w\u001b[0m \u001b[2m5h:\u001b[0m \u001b[1;31m91%\u001b[0m\nx\u001b[38;5;208my\u001b[39mz'
+    );
+    expect(lines).toHaveLength(2);
+    expect(lines[0].map((s) => [s.text, s.color, s.bold, s.dim])).toEqual([
+      ['/w', 'cyan', false, false],
+      [' ', '', false, false],
+      ['5h:', '', false, true],
+      [' ', '', false, false],
+      ['91%', 'red', true, false],
+    ]);
+    expect(lines[1].map((s) => [s.text, s.color])).toEqual([
+      ['x', ''],
+      ['y', ''],
+      ['z', ''],
+    ]);
+    expect(h.statusLineSegments('plain')).toEqual([[{ text: 'plain', color: '', bold: false, dim: false }]]);
+  });
+
+  it("skips an extended colour's parameters even where they look like mapped codes", () => {
+    const colours = (text: string) => h.statusLineSegments(text)[0].map((s) => [s.text, s.color]);
+    // 31 would be red, 32 green and 33 yellow if the parameters were read as codes.
+    expect(colours('\u001b[32mg\u001b[38;5;31mx')).toEqual([
+      ['g', 'green'],
+      ['x', ''],
+    ]);
+    expect(colours('\u001b[48;5;32my')).toEqual([['y', '']]);
+    expect(colours('\u001b[33mz\u001b[38;2;31;32;33mw')).toEqual([
+      ['z', 'yellow'],
+      ['w', ''],
+    ]);
   });
 
   it('formats the running time like the CLI', () => {
@@ -1671,6 +1706,29 @@ describe('chat view module', () => {
     expect(app._uploadAndInsertImages).toHaveBeenCalledTimes(1);
   });
 
+  it('draws the statusline under the message box and follows its changes', () => {
+    const { app } = loadModule();
+    app.sessions.set('s1', { id: 's1', mode: 'claude', status: 'idle', statusLine: '\u001b[32mctx: 5%\u001b[0m' });
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    const a = app as unknown as {
+      _onChatViewStatusLine: (d: { sessionId: string; text: string }) => void;
+      _chatView: { statusline: HTMLElement; root: HTMLElement };
+    };
+    const line = a._chatView.statusline;
+    expect(line.hidden).toBe(false);
+    expect(line.textContent).toBe('ctx: 5%');
+    expect(line.querySelector('.sl-green')!.textContent).toBe('ctx: 5%');
+    // Below the message box, as in the CLI.
+    expect(a._chatView.root.lastElementChild).toBe(line);
+
+    a._onChatViewStatusLine({ sessionId: 's1', text: '<b>not html</b>' });
+    expect(line.textContent).toBe('<b>not html</b>');
+    expect(line.querySelector('b')).toBeNull();
+    a._onChatViewStatusLine({ sessionId: 's1', text: '' });
+    expect(line.hidden).toBe(true);
+  });
+
   it('shows the waiting notice while a permission prompt or question is pending', () => {
     const { app } = loadModule();
     app.setChatViewMode('s1', 'chat');
@@ -2328,6 +2386,13 @@ describe('chat view wiring', () => {
       /\n {2}_onTranscriptToolEnd\(data\) \{\s*this\._onEditHistoryTranscriptEvent\(data\);\s*this\._onChatViewToolEnd\?\.\(data\);\s*\}/
     );
     expect(chatView).toContain('_onChatViewToolEnd(data) {');
+  });
+
+  it('routes session:statusLine to the chat view', () => {
+    const app = read('app.js');
+    const chatView = read('chat-view.js');
+    expect(app).toContain("[SSE_EVENTS.SESSION_STATUS_LINE, '_onChatViewStatusLine']");
+    expect(chatView).toContain('_onChatViewStatusLine(');
   });
 
   it('passes the keep-alive flag of session:working and session:idle to the chat view', () => {

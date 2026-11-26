@@ -1183,6 +1183,18 @@ export interface SessionState {
    */
   displayModel?: DisplayModel;
   /**
+   * What the CLI's statusline shows under its composer, for the chat view: the user's own
+   * statusline output (SGR colour sequences kept, everything else stripped by
+   * statusline-text.ts) or Codeman's own footer. Absent until the first report. Persisted,
+   * and restored after a restart until the next report replaces it, because an idle Claude
+   * session runs its statusline command again only on its next turn or when its prompt cache
+   * expires. Absent while the current launch is known to carry no exporter
+   * (`statusLineExporter` set and other than `injected`); kept while `statusLineExporter` is
+   * unknown, so a restored value still shows.
+   * Untrusted display text: render as text.
+   */
+  statusLine?: string;
+  /**
    * The next prompt the CLI suggests in its empty composer (Claude Code draws it faint), read
    * off the pane after a turn ends, for the chat view's message box. Absent when there is none,
    * and cleared when a turn starts. Written to state.json with the rest of the session state,

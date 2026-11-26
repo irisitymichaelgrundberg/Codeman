@@ -1682,6 +1682,62 @@ function chatViewElapsed(ms) {
   return `${sec}s`;
 }
 
+/** SGR foreground codes the statusline maps onto skin colours; anything else draws in the default. */
+const CHAT_STATUSLINE_COLORS = {
+  30: 'muted',
+  31: 'red',
+  32: 'green',
+  33: 'yellow',
+  34: 'blue',
+  35: 'magenta',
+  36: 'cyan',
+  90: 'muted',
+  91: 'red',
+  92: 'green',
+  93: 'yellow',
+  94: 'blue',
+  95: 'magenta',
+  96: 'cyan',
+};
+
+/**
+ * A statusline's text (the server keeps only SGR colour sequences in it) as lines of styled
+ * segments: `[[{ text, color, bold, dim }]]`. Colours are names the page maps to the skin's own
+ * tokens, so a statusline written for a dark terminal stays readable on a light skin. 256-colour
+ * and true-colour sequences carry no name and draw in the default colour.
+ */
+function chatViewStatusLineSegments(text) {
+  const lines = [];
+  let style = { color: '', bold: false, dim: false };
+  for (const line of String(text ?? '').split('\n')) {
+    const segments = [];
+    const parts = line.split(/\x1b\[([0-9;]*)m/);
+    for (let i = 0; i < parts.length; i++) {
+      if (i % 2 === 0) {
+        if (parts[i]) segments.push({ text: parts[i], ...style });
+        continue;
+      }
+      const codes = parts[i] === '' ? [0] : parts[i].split(';').map(Number);
+      for (let j = 0; j < codes.length; j++) {
+        const code = codes[j];
+        if (code === 0) style = { color: '', bold: false, dim: false };
+        else if (code === 1) style = { ...style, bold: true };
+        else if (code === 2) style = { ...style, dim: true };
+        else if (code === 22) style = { ...style, bold: false, dim: false };
+        else if (code === 39) style = { ...style, color: '' };
+        else if (code === 38 || code === 48) {
+          // Extended colour: skip its parameters (5;n or 2;r;g;b) and draw in the default.
+          j += codes[j + 1] === 5 ? 2 : codes[j + 1] === 2 ? 4 : 0;
+          if (code === 38) style = { ...style, color: '' };
+        } else if (CHAT_STATUSLINE_COLORS[code]) style = { ...style, color: CHAT_STATUSLINE_COLORS[code] };
+        else if (code === 37 || code === 97) style = { ...style, color: '' };
+      }
+    }
+    lines.push(segments);
+  }
+  return lines;
+}
+
 /**
  * Whether a prompt is folded, and what its folded form shows: the first lines, capped
  * in characters so one enormous pasted line folds too.
@@ -1870,6 +1926,7 @@ if (typeof window !== 'undefined') {
     pendingConfirmed: chatViewPendingConfirmed,
     activity: chatViewActivity,
     compacting: chatViewCompacting,
+    statusLineSegments: chatViewStatusLineSegments,
     elapsed: chatViewElapsed,
     enterSends: chatViewEnterSends,
     sendPayload: chatViewSendPayload,
@@ -2050,6 +2107,7 @@ const SSE_EVENTS = {
   SESSION_RUNNING: 'session:running',
   SESSION_STATUS_TELEMETRY: 'session:statusTelemetry',
   SESSION_PROMPT_CACHE: 'session:promptCache',
+  SESSION_STATUS_LINE: 'session:statusLine',
   SESSION_KEEP_WARM: 'session:keepWarm',
 
   // Scheduled runs

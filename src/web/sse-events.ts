@@ -5,10 +5,10 @@
  * and referenced by the frontend (`SSE_EVENTS` in `constants.js`).
  * Both files MUST be kept in sync.
  *
- * 165 event constants organized by category:
+ * 166 event constants organized by category:
  * - **Core** (1): init
  * - **Transport** (1): sse:heartbeat
- * - **Session lifecycle** (25): created, updated, deleted, terminal, idle, working, ...
+ * - **Session lifecycle** (26): created, updated, deleted, terminal, idle, working, ...
  * - **Session: Ralph** (6): ralphLoopUpdate, todoUpdate, completionDetected, ...
  * - **Session: Bash tools** (3): bashToolStart, bashToolEnd, bashToolsUpdate
  * - **Session: Plan** (4): planTaskUpdate, planCheckpoint, planRollback, planTaskAdded
@@ -122,6 +122,11 @@ export const SessionRunning = 'session:running' as const;
 export const SessionStatusTelemetry = 'session:statusTelemetry' as const;
 /** Prompt-cache state of one session's main conversation changed (`{ sessionId, ...PromptCacheStatus }`). */
 export const SessionPromptCache = 'session:promptCache' as const;
+/**
+ * The text of one session's statusline changed (`{ sessionId, text }`): the user's own
+ * statusline output, colour sequences kept (statusline-text.ts), or Codeman's own footer.
+ */
+export const SessionStatusLine = 'session:statusLine' as const;
 /** The prompt-cache keep-warm's status for one session changed (`{ sessionId, ...KeepWarmStatus }`). */
 export const SessionKeepWarm = 'session:keepWarm' as const;
 
@@ -543,6 +548,7 @@ export const SseEvent = {
   SessionRunning,
   SessionStatusTelemetry,
   SessionPromptCache,
+  SessionStatusLine,
   SessionKeepWarm,
 
   // Session: Ralph

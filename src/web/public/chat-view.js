@@ -309,7 +309,12 @@ Object.assign(CodemanApp.prototype, {
     // The status line follows the last message, inside the scrolling area, so an eye watching
     // the newest output finds it there and not at the bottom of the window.
     scroller.insertBefore(status, empty);
-    root.append(scroller, dialog, composer);
+    // The CLI's statusline, under the message box where the CLI draws it.
+    const statusline = document.createElement('div');
+    statusline.className = 'chat-view-statusline';
+    statusline.setAttribute('data-i18n-skip', '');
+    statusline.hidden = true;
+    root.append(scroller, dialog, composer, statusline);
     wrap.append(root, toggle);
 
     input.addEventListener('keydown', (ev) => {
@@ -423,6 +428,7 @@ Object.assign(CodemanApp.prototype, {
       status,
       statusText,
       statusSub,
+      statusline,
       input,
       sendBtn,
       stopBtn,
@@ -548,6 +554,7 @@ Object.assign(CodemanApp.prototype, {
     view.root.querySelector('.chat-view-dialog-text').textContent =
       `${agent} is waiting for your answer in the terminal.`;
     this._chatViewSyncDialog(id);
+    this._chatViewRenderStatusLine();
     this._chatViewRenderStatus();
     this._chatViewSyncComposer();
     if (previousId !== id || !wasShowing) this._chatViewReload({ immediate: true });
@@ -661,6 +668,42 @@ Object.assign(CodemanApp.prototype, {
     this._chatViewRenderStatus();
     this._chatViewSyncComposer();
     this._chatViewReload();
+  },
+
+  /** SSE `session:statusLine`: the session's statusline text changed. */
+  _onChatViewStatusLine(data) {
+    if (!data?.sessionId || typeof data.text !== 'string') return;
+    const session = this.sessions?.get(data.sessionId);
+    if (session) session.statusLine = data.text;
+    if (data.sessionId === this._chatView?.sessionId) this._chatViewRenderStatusLine();
+  },
+
+  /**
+   * Draw the session's statusline under the message box: one row per line, colours mapped to
+   * the skin's own (`CodemanChatView.statusLineSegments`). The text is the user's statusline
+   * command's output, so it goes in through `textContent` only. Redrawn only when it changed.
+   */
+  _chatViewRenderStatusLine() {
+    const view = this._chatView;
+    if (!view) return;
+    const text = this.sessions?.get(view.sessionId)?.statusLine || '';
+    if (view.statuslineText === text) return;
+    view.statuslineText = text;
+    view.statusline.hidden = !text;
+    const rows = window.CodemanChatView.statusLineSegments(text).map((segments) => {
+      const row = document.createElement('div');
+      row.className = 'chat-view-statusline-row';
+      for (const seg of segments) {
+        const span = document.createElement('span');
+        span.textContent = seg.text;
+        if (seg.color) span.classList.add(`sl-${seg.color}`);
+        if (seg.bold) span.classList.add('sl-bold');
+        if (seg.dim) span.classList.add('sl-dim');
+        row.appendChild(span);
+      }
+      return row;
+    });
+    view.statusline.replaceChildren(...rows);
   },
 
   /** app.js updateTabAlertFromHooks(): a dialog appeared or was answered. */

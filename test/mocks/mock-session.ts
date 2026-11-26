@@ -65,6 +65,13 @@ export class MockSession extends EventEmitter {
     this.promptCache = status;
     return changed;
   }
+  /** Mirrors Session.statusLine / setStatusLine (fed by POST /api/status-telemetry). */
+  statusLine = '';
+  setStatusLine(text: string): boolean {
+    if (text === this.statusLine) return false;
+    this.statusLine = text;
+    return true;
+  }
   /** Mirrors the prompt-cache keep-warm surface on Session (prompt-cache-keepwarm.ts). */
   keepAliveTurnActive = false;
   endKeepAliveTurn(): void {

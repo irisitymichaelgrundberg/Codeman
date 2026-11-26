@@ -745,6 +745,12 @@ const RateLimitWindowSchema = z
 
 export const StatusTelemetrySchema = z.object({
   sessionId: z.string().min(1).max(100),
+  // Base64 of the user's own statusline output (the exporter's wrap branch), for the chat view.
+  // 4 KiB of output encodes to under 5.5k characters.
+  rendered: z.string().max(8192).optional(),
+  // The wrap branch's telemetry post: the user's own command prints the statusline, so the route
+  // must not record Codeman's footer as the statusline text.
+  wrapped: z.boolean().optional(),
   data: z
     .object({
       // The conversation the pane runs, as every hook reports it (claude-conversation-report.ts).
