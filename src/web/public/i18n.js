@@ -228,15 +228,19 @@
     // Chat view (chat-view.js) and its App Settings row.
     'Toggle Chat / Terminal View': '切换聊天 / 终端视图',
     Chat: '聊天',
+    Message: '消息',
+    'Attach files': '附加文件',
     'Open terminal': '打开终端',
     Conversation: '对话',
     'Session view': '会话视图',
     'Show the conversation (Alt+Shift+C)': '显示对话 (Alt+Shift+C)',
     'Show the terminal (Alt+Shift+C)': '显示终端 (Alt+Shift+C)',
-    'No messages yet.': '还没有消息。',
+    'Interrupt the current turn (sends Esc)': '中断当前轮次（发送 Esc）',
+    'No messages yet. Send a prompt to start.': '还没有消息。发送提示词开始。',
+    'Message not sent. Check the connection and try again.': '消息未发送。请检查连接后重试。',
     'Open Claude sessions in Chat view': '以聊天视图打开 Claude 会话',
-    "Show a session's conversation rendered as text instead of the terminal. Each session remembers its own choice, and Alt+Shift+C or the Chat / Terminal switch changes it. Not on phones.":
-      '以渲染后的文本显示会话的对话，代替终端。每个会话记住自己的选择，可用 Alt+Shift+C 或聊天 / 终端开关切换。手机上不可用。',
+    "Show a session's conversation rendered as text, with a message box, instead of the terminal. Each session remembers its own choice, and Alt+Shift+C or the Chat / Terminal switch changes it. Not on phones.":
+      '以渲染后的文本和消息框显示会话的对话，代替终端。每个会话记住自己的选择，可用 Alt+Shift+C 或聊天 / 终端开关切换。手机上不可用。',
     'Show the Chat / Terminal switch': '显示聊天 / 终端开关',
     'Show the Chat / Terminal switch at the top right of a Claude session. Alt+Shift+C switches views without it. Not on phones.':
       '在 Claude 会话右上角显示聊天 / 终端开关。没有它时，Alt+Shift+C 也能切换视图。手机上不可用。',
@@ -1725,6 +1729,17 @@
       [/^Show (\d+) more$/, (_m, count) => `再显示 ${count} 项`],
       // Chat view (chat-view.js).
       [/^Show all \((\d+) lines?\)$/, (_m, count) => `显示全部（${count} 行）`],
+      [
+        /^Message (.+) \(Enter to send, Shift\+Enter for a new line\)$/,
+        (_m, agent) => `给 ${agent} 发消息（Enter 发送，Shift+Enter 换行）`,
+      ],
+      // Both before the bare `Message (.+)` pattern below, which would take these texts too.
+      [
+        /^Message too long to send \(maximum (.+) characters\)$/,
+        (_m, max) => `消息过长，无法发送（最多 ${max} 个字符）`,
+      ],
+      [/^Message not sent: (.+)$/, (_m, why) => `消息未发送：${why}`],
+      [/^Message (.+)$/, (_m, agent) => `给 ${agent} 发消息`],
       [/^Show (\d+) more \((\d+) remaining\)$/, (_m, count, remaining) => `再显示 ${count} 项（剩余 ${remaining} 项）`],
       [/^Lifetime: (\d+) sessions created$/, (_m, count) => `累计已创建 ${count} 个会话`],
       [/^Tunnel active: (.+)$/, (_m, url) => `隧道已启用：${url}`],

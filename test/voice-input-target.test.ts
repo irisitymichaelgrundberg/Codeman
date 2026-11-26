@@ -244,6 +244,40 @@ describe('dictation target', () => {
     expect(paneB.focus).not.toHaveBeenCalled();
   });
 
+  it('while the chat view shows, direct-mode dictation goes into its message box and nothing reaches the pane', () => {
+    const { voice, app, appendText, sendInput, sendInputAsync, gear } = load({ localEcho: true });
+    const insert = vi.fn();
+    app._chatViewShowing = () => true;
+    app._chatViewInsertText = insert;
+    voice.start();
+
+    voice._insertText('  fix the login bug ');
+
+    expect(insert).toHaveBeenCalledWith('fix the login bug');
+    expect(appendText).not.toHaveBeenCalled();
+    expect(sendInput).not.toHaveBeenCalled();
+    expect(sendInputAsync).not.toHaveBeenCalled();
+    // No green Enter button, and the message box keeps the focus.
+    expect(gear.addEventListener).not.toHaveBeenCalled();
+    expect((app.terminal as { focus: ReturnType<typeof vi.fn> }).focus).not.toHaveBeenCalled();
+  });
+
+  it('dictation for a session the user left goes to that session, never into the chat box on screen', () => {
+    const { voice, app, appendText, sendInputAsync } = load({ localEcho: true });
+    const insert = vi.fn();
+    app._chatViewShowing = () => true;
+    app._chatViewInsertText = insert;
+    voice.start();
+    app.activeSessionId = 'session-b'; // user switched tabs while speaking
+
+    voice._insertText('for session a');
+
+    // The chat box belongs to the session on screen, not to the recording's target.
+    expect(insert).not.toHaveBeenCalled();
+    expect(appendText).not.toHaveBeenCalled();
+    expect(sendInputAsync).toHaveBeenCalledWith('session-a', 'for session a', { useMux: true });
+  });
+
   it('refuses to start with no session at all', () => {
     const { voice, app, showToast } = load();
     app.activeSessionId = null;

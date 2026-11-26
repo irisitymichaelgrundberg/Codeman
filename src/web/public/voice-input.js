@@ -16,7 +16,7 @@
  * - VoiceInput — High-level voice input controller. Toggle mode: tap mic to start, tap
  *   again to stop. Auto-stops after configurable silence. Shows floating preview overlay with recording
  *   indicator, level meter (AnalyserNode), and elapsed timer. Two insert modes: "direct"
- *   (inject into local echo overlay or PTY) and "compose" (editable textarea overlay).
+ *   (inject into local echo overlay or PTY, or into the chat view's message box while it shows) and "compose" (editable textarea overlay).
  *   Includes a temporary green Send button that replaces the settings gear icon after voice input.
  *   Web Speech API retries empty runs twice with backoff and preserves late results after Stop.
  *
@@ -26,6 +26,7 @@
  *
  * @dependency mobile-handlers.js (MobileDetection for device checks)
  * @dependency app.js (uses global `app` for sendInput, showToast, terminal focus)
+ * @dependency chat-view.js at runtime (app._chatViewShowing, app._chatViewInsertText)
  * @loadorder 3 of 15 — loaded after mobile-handlers.js, before notification-manager.js
  */
 
@@ -1113,6 +1114,13 @@ const VoiceInput = {
       // sees, so it goes straight to the session instead.
       const isActive = target === app.activeSessionId;
       const tilesOpen = !!app._tilesOwnTerminal?.();
+      // While the chat view covers the terminal, the text goes into its message box: typed
+      // into the hidden pane, it would sit unseen in the composer and the next chat Send would
+      // paste after it. The box keeps the focus, so the terminal is not refocused.
+      if (isActive && !tilesOpen && app._chatViewShowing?.()) {
+        app._chatViewInsertText(trimmed);
+        return;
+      }
       if (isActive && !tilesOpen && app._localEchoEnabled && app._localEchoOverlay) {
         app._localEchoOverlay.appendText(trimmed);
       } else {

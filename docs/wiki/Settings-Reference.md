@@ -115,7 +115,7 @@ stores those diffs (secrets included) under `~/.codeman/edit-history/`; see
 
 Under **Panels**, **Open Claude sessions in Chat view** (per device, off by default, never on
 phones) picks the view a Claude session opens in. The chat view draws the session's conversation
-as text, over the terminal. To type, switch to the Terminal view. The terminal keeps running underneath, so switching
+as text, with a message box under it, over the terminal. The terminal keeps running underneath, so switching
 views never resizes it. The chat view applies to local and Docker Claude sessions in the main
 view. Remote (SSH) and adopted sessions keep the terminal, and so do the tiles of the tile grid
 and the second pane of a split. Each session remembers its own choice in this browser: press

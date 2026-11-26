@@ -40,6 +40,16 @@ from its tab, or bind a key to it in App Settings → Shortcuts.
 
 Anything you copy is cleaned on the way to the clipboard: each line loses the padding spaces a full-screen program paints across the rest of the row. Leading indentation is left exactly as it is, so indented code, a `git log` message body and `git diff` context lines paste back the way they looked on screen. An `Alt+drag` rectangular selection is copied exactly as it looks, so its columns stay lined up.
 
+## Chat view
+
+The message box of [the chat view](Settings-Reference#header--panels) has keys of its own.
+
+| Shortcut                      | Action                                                       |
+| ----------------------------- | ------------------------------------------------------------ |
+| `Enter`                       | Send. On a tablet, or any device whose main pointer is touch, `Enter` adds a line, and the Send button or `Ctrl+Enter` / `Cmd+Enter` sends. |
+| `Ctrl+Enter` / `Cmd+Enter`    | Send, on any device.                                         |
+| `Shift+Enter` / `Alt+Enter`   | Insert a newline without sending.                            |
+
 ## Tile grid
 
 | Shortcut                    | Action                                                       |

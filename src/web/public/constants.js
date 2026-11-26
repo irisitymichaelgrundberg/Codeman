@@ -1577,6 +1577,31 @@ function chatViewPromptText(text) {
   );
 }
 
+/** A prompt reduced to what two copies of it must share: the text, line breaks as `\n`, trimmed. */
+function chatViewPromptIdentity(text) {
+  return chatViewPromptText(text).replace(/\r\n?/g, '\n').trim();
+}
+
+/** How many user messages in `messages` are the prompt `text`. */
+function chatViewPromptCount(messages, text) {
+  const wanted = chatViewPromptIdentity(text);
+  if (!wanted || !Array.isArray(messages)) return 0;
+  let count = 0;
+  for (const m of messages) {
+    if (m && m.role === 'user' && typeof m.text === 'string' && chatViewPromptIdentity(m.text) === wanted) count++;
+  }
+  return count;
+}
+
+/**
+ * Whether a prompt the chat view drew before it reached the transcript (a pending prompt) can
+ * go, because the transcript now has it. `baseline` is how many copies the transcript held
+ * when it was sent, so sending the same words twice waits for the second copy.
+ */
+function chatViewPendingConfirmed(pending, messages) {
+  return !!pending && chatViewPromptCount(messages, pending.text) > (pending.baseline || 0);
+}
+
 /** A running turn's length as the CLI shows it: `14s`, `2m 05s`, `1h 03m`. */
 function chatViewElapsed(ms) {
   const total = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
@@ -1601,6 +1626,39 @@ function chatViewPromptFold(text) {
   let head = lines.slice(0, CHAT_PROMPT_HEAD_LINES).join('\n');
   if (head.length > CHAT_PROMPT_HEAD_CHARS) head = `${head.slice(0, CHAT_PROMPT_HEAD_CHARS)}…`;
   return { folded: true, head, totalLines: lines.length };
+}
+
+/**
+ * Whether a keydown in the message box sends. Enter sends and Shift+Enter (or Alt+Enter)
+ * adds a line; on a touch device a bare Enter adds a line and only the Send button (or
+ * Ctrl/Cmd+Enter from a hardware keyboard) sends, as in the phone's Compose dialog. A key
+ * that ends an IME composition never sends.
+ */
+function chatViewEnterSends(ev, touch) {
+  if (!ev || ev.key !== 'Enter') return false;
+  if (ev.isComposing || ev.keyCode === 229) return false;
+  if (ev.shiftKey || ev.altKey) return false;
+  if (ev.ctrlKey || ev.metaKey) return true;
+  return !touch;
+}
+
+/**
+ * The text that goes to the pane for a message box value: bracketed-paste markers
+ * removed, line breaks normalised to `\n`, trailing whitespace dropped, and one `\r`
+ * that submits. Null when there is nothing to send.
+ *
+ * The server sends the text as one bracketed paste. A pasted `ESC[201~` inside it would
+ * end that paste early, and every byte after it would reach the CLI as typed keys, so
+ * the markers are stripped first, as the phone's Compose box does
+ * (keyboard-accessory.js `_sendBracketedPaste`). The strip repeats until none is left:
+ * one pass over `ESC[20` + `ESC[201~` + `1~` leaves an `ESC[201~` behind.
+ */
+function chatViewSendPayload(value) {
+  let text = String(value ?? '');
+  while (/\x1b\[20[01]~/.test(text)) text = text.replace(/\x1b\[20[01]~/g, '');
+  text = text.replace(/\r\n?/g, '\n').trimEnd();
+  if (text.trim() === '') return null;
+  return `${text}\r`;
 }
 
 if (typeof window !== 'undefined') {
@@ -1676,7 +1734,11 @@ if (typeof window !== 'undefined') {
     renderPlan: chatViewRenderPlan,
     promptFold: chatViewPromptFold,
     promptText: chatViewPromptText,
+    promptCount: chatViewPromptCount,
+    pendingConfirmed: chatViewPendingConfirmed,
     elapsed: chatViewElapsed,
+    enterSends: chatViewEnterSends,
+    sendPayload: chatViewSendPayload,
   };
   window.CodemanInputLimit = {
     FRAME_MAX_CHARS: INPUT_FRAME_MAX_CHARS,

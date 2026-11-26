@@ -24101,7 +24101,8 @@ body.keyboard-visible .terminal-container .xterm-screen {
   text-decoration: underline;
 }
 
-.chat-view-dialog {
+.chat-view-dialog,
+.chat-view-composer {
   width: calc(100% - 32px);
   max-width: 820px;
   margin-inline: auto;
@@ -24153,6 +24154,47 @@ body.keyboard-visible .terminal-container .xterm-screen {
   50% { opacity: 1; }
 }
 
+.chat-view-composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding: 8px 8px 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-card);
+}
+
+.chat-view-composer:focus-within {
+  border-color: rgba(var(--accent-rgb), 0.6);
+}
+
+.chat-view-input {
+  flex: 1;
+  min-height: 32px;
+  padding: 5px 0;
+  border: 0;
+  outline: none;
+  resize: none;
+  background: transparent;
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'PingFang SC',
+    'Hiragino Sans GB', 'Segoe UI', 'Helvetica Neue', Helvetica, Arial,
+    'Noto Sans CJK SC', sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.chat-view-input::placeholder {
+  color: var(--text-muted);
+}
+
+.chat-view-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .chat-view-btn {
   height: 32px;
   padding: 0 12px;
@@ -24167,7 +24209,11 @@ body.keyboard-visible .terminal-container .xterm-screen {
   white-space: nowrap;
 }
 
-.chat-view-btn:hover {
+.chat-view-btn[hidden] {
+  display: none;
+}
+
+.chat-view-btn:hover:not(:disabled) {
   background: var(--bg-hover);
 }
 
@@ -24178,9 +24224,22 @@ body.keyboard-visible .terminal-container .xterm-screen {
   font-weight: 600;
 }
 
-.chat-view-btn-primary:hover {
+.chat-view-btn-primary:hover:not(:disabled) {
   background: var(--accent);
   filter: brightness(1.08);
+}
+
+.chat-view-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.chat-view-btn-icon {
+  width: 32px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .chat-view-btn:focus-visible,
@@ -24249,6 +24308,13 @@ body.chat-view-showing.touch-device #cjkInput.cjk-input-visible {
 @media (prefers-reduced-motion: reduce) {
   .chat-view-status-dot { animation: none; }
   .chat-view-toggle { transition: none; }
+}
+
+/* The composer's border shows focus (:focus-within above), so the box itself
+   draws no second ring inside it. */
+.chat-view .chat-view-input:focus-visible {
+  border-color: transparent;
+  box-shadow: none;
 }
 
 /* The conversation takes focus only so keys never reach the hidden terminal; it draws no ring. */

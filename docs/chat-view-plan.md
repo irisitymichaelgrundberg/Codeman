@@ -144,9 +144,10 @@ of each turn.
 ## How the user sends a prompt
 
 The message box is a multiline text area. On a desktop, Enter sends and
-Shift+Enter adds a line. On a touch device the Send button sends, and so does
-Ctrl+Enter or Cmd+Enter from a hardware keyboard. Plain Enter adds a line there, as
-in the phone's Compose dialog.
+Shift+Enter adds a line. On a tablet, or any device whose main pointer is touch,
+the Send button sends, and so does Ctrl+Enter or Cmd+Enter from a hardware keyboard.
+Plain Enter adds a line there, as in the phone's Compose dialog. A touchscreen
+laptop counts as a desktop, because its main pointer is the mouse or touchpad.
 
 A send posts the text and its Enter as one input to `POST /api/sessions/:id/input`
 with `useMux: true`. The server then pastes the text through tmux, presses Enter,

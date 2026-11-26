@@ -3,13 +3,17 @@
  *
  * What is pinned, and why:
  * - The pure helpers (`CodemanChatView` in constants.js): keep-warm turns are never drawn, a
- *   growing thread appends instead of redrawing, and long prompts fold.
+ *   growing thread appends instead of redrawing, long prompts fold, and Enter sends only where
+ *   the plan says it does.
  * - Which sessions can show it comes from `window.__codemanChatViewModes` (the transcript
  *   capability), and remote and adopted sessions never do.
  * - The chat view covers the terminal without removing it, and a session remembers its view.
- *   A focus that lands on the hidden terminal moves to the conversation.
- * - A dialog in the pane shows the "waiting in the terminal" notice.
- * - Codeman's own keep-alive turn shows no status line.
+ * - A send goes through `POST /api/sessions/:id/input` with `useMux: true`: the WebSocket path
+ *   writes raw bytes and never arms the server's Enter re-press. A retried request carries the
+ *   same `clientId` and `seq`, so the server applies it once, and a refused one keeps the text.
+ * - A dialog in the pane shows the "waiting in the terminal" notice, and nothing is sent while
+ *   it waits: the text and the Enter would go into the dialog.
+ * - Codeman's own keep-alive turn shows no status line and no Stop button.
  * - The toggle chord is swallowed by the xterm key handler, so it never types into the session.
  *
  * The real constants.js and chat-view.js run inside a JSDOM window.
@@ -24,7 +28,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 const read = (name: string) => readFileSync(resolve(import.meta.dirname, '../src/web/public', name), 'utf8');
 
-type Msg = { role: string; text: string; turn?: number; keepAlive?: boolean; queued?: boolean };
+type Msg = { role: string; text: string; turn?: number; keepAlive?: boolean; queued?: boolean; kind?: string };
 
 interface ChatHelpers {
   visibleMessages: (m: unknown) => Msg[];
@@ -32,7 +36,11 @@ interface ChatHelpers {
   renderPlan: (a: string[], b: string[]) => { mode: string; from?: number };
   promptFold: (t: string) => { folded: boolean; head: string; totalLines: number };
   promptText: (t: string) => string;
+  promptCount: (m: Msg[], t: string) => number;
+  pendingConfirmed: (p: { text: string; baseline: number }, m: Msg[]) => boolean;
   elapsed: (ms: number) => string;
+  enterSends: (ev: Record<string, unknown>, touch: boolean) => boolean;
+  sendPayload: (v: string) => string | null;
 }
 
 function loadHelpers(): ChatHelpers {
@@ -85,6 +93,21 @@ describe('CodemanChatView helpers', () => {
     expect(wide.head.length).toBeLessThanOrEqual(801);
   });
 
+  it('sends on Enter on a desktop, never during an IME composition or with Shift', () => {
+    expect(h.enterSends({ key: 'Enter' }, false)).toBe(true);
+    expect(h.enterSends({ key: 'Enter', shiftKey: true }, false)).toBe(false);
+    expect(h.enterSends({ key: 'Enter', altKey: true }, false)).toBe(false);
+    expect(h.enterSends({ key: 'Enter', isComposing: true }, false)).toBe(false);
+    expect(h.enterSends({ key: 'Enter', keyCode: 229 }, false)).toBe(false);
+    expect(h.enterSends({ key: 'a' }, false)).toBe(false);
+  });
+
+  it('adds a line on Enter on a touch device, where only Send or Ctrl+Enter sends', () => {
+    expect(h.enterSends({ key: 'Enter' }, true)).toBe(false);
+    expect(h.enterSends({ key: 'Enter', ctrlKey: true }, true)).toBe(true);
+    expect(h.enterSends({ key: 'Enter', metaKey: true }, true)).toBe(true);
+  });
+
   it("unwraps Claude Code's pasted_content tag so a pasted prompt keeps its lines", () => {
     expect(h.promptText('<pasted_content id="a9da">\nline 1\nline 2\n</pasted_content>')).toBe('line 1\nline 2');
     expect(h.promptText('before <pasted_content>x</pasted_content> after')).toBe('before x after');
@@ -94,12 +117,39 @@ describe('CodemanChatView helpers', () => {
     expect(h.promptText('plain')).toBe('plain');
   });
 
+  it('confirms a pending prompt only once a NEW copy of it is in the transcript', () => {
+    const msgs: Msg[] = [
+      { role: 'user', text: 'again', turn: 1 },
+      { role: 'assistant', text: 'again', turn: 1 },
+      { role: 'user', text: '<pasted_content id="1">\nline a\nline b\n</pasted_content id="1">', turn: 2 },
+    ];
+    expect(h.promptCount(msgs, 'again')).toBe(1);
+    expect(h.promptCount(msgs, 'line a\r\nline b  ')).toBe(1);
+    expect(h.pendingConfirmed({ text: 'again', baseline: 1 }, msgs)).toBe(false);
+    expect(h.pendingConfirmed({ text: 'again', baseline: 0 }, msgs)).toBe(true);
+    expect(h.pendingConfirmed({ text: 'missing', baseline: 0 }, msgs)).toBe(false);
+  });
+
   it('formats the running time like the CLI', () => {
     expect(h.elapsed(0)).toBe('0s');
     expect(h.elapsed(14_900)).toBe('14s');
     expect(h.elapsed(125_000)).toBe('2m 05s');
     expect(h.elapsed(3_780_000)).toBe('1h 03m');
     expect(h.elapsed(-5)).toBe('0s');
+  });
+
+  it('builds the pane payload: newlines kept, trailing space dropped, one submitting CR', () => {
+    expect(h.sendPayload('hello')).toBe('hello\r');
+    expect(h.sendPayload('a\r\nb\n\n  ')).toBe('a\nb\r');
+    expect(h.sendPayload('  \n ')).toBeNull();
+    expect(h.sendPayload('')).toBeNull();
+  });
+
+  it('strips bracketed-paste markers, so a pasted end marker cannot end the paste early', () => {
+    expect(h.sendPayload('a\x1b[201~b')).toBe('ab\r');
+    expect(h.sendPayload('a\x1b[200~b')).toBe('ab\r');
+    // One pass over this leaves an end marker behind: the strip repeats until none is left.
+    expect(h.sendPayload('x\x1b[20\x1b[201~1~y')).toBe('xy\r');
   });
 });
 
@@ -116,6 +166,9 @@ interface ChatApp {
   showToast: Api;
   _sendInputAsync: Api;
   loadAppSettingsFromStorage: () => Record<string, unknown>;
+  _admitPromptAttachments?: Api;
+  _uploadAndInsertImages?: Api;
+  _chatViewAttach: (files: File[]) => Promise<void>;
   _chatViewReload: () => void;
   onChatViewTurnEvent: (id: string, idle: boolean, keepAlive?: boolean) => void;
   chatViewEligible: (id: string) => boolean;
@@ -125,6 +178,7 @@ interface ChatApp {
   onChatViewHooksChanged: (id: string) => void;
   _onChatViewTranscriptUpdate: (d: { sessionId: string }) => void;
   _chatViewFetch: () => Promise<void>;
+  _chatViewSend: () => Promise<void>;
   _chatViewForget: (id: string) => void;
   _chatViewPruneModes: (ids: Set<string>) => void;
   _chatViewHide: () => void;
@@ -135,7 +189,9 @@ interface ChatApp {
     toggle: HTMLElement;
     thread: HTMLElement;
     dialog: HTMLElement;
-    scroller: HTMLElement;
+    input: HTMLTextAreaElement;
+    sendBtn: HTMLButtonElement;
+    stopBtn: HTMLButtonElement;
     status: HTMLElement;
     statusText: HTMLElement;
     statusTimer: unknown;
@@ -231,37 +287,50 @@ describe('chat view module', () => {
     expect(win.document.body.classList.contains('chat-view-showing')).toBe(false);
   });
 
-  it('moves a focus that lands in the hidden terminal to the conversation', () => {
+  it('moves a focus that lands in the hidden terminal to the message box', () => {
     const { win, app } = loadModule();
     app.setChatViewMode('s1', 'chat');
     app.onChatViewActiveSession('s1');
     const inner = win.document.createElement('textarea');
     win.document.getElementById('terminalContainer')!.appendChild(inner);
     inner.focus();
-    expect(win.document.activeElement).toBe(app._chatView.scroller);
+    expect(win.document.activeElement).toBe(app._chatView.input);
   });
 
-  it('moves a focus that lands on the CJK input field to the conversation', () => {
+  it('moves a focus that lands on the CJK input field to the message box', () => {
     // With CJK input on, terminal.focus() lands on #cjkInput, outside #terminalContainer.
     const { win, app } = loadModule();
     app.setChatViewMode('s1', 'chat');
     app.onChatViewActiveSession('s1');
     (win.document.getElementById('cjkInput') as HTMLTextAreaElement).focus();
-    expect(win.document.activeElement).toBe(app._chatView.scroller);
+    expect(win.document.activeElement).toBe(app._chatView.input);
   });
 
-  it('keeps a dropped file from opening in the browser while Chat shows', () => {
+  it('keeps a file dropped on the Chat / Terminal switch from opening in the browser', () => {
     const { win, app } = loadModule();
     app.setChatViewMode('s1', 'chat');
     app.onChatViewActiveSession('s1');
-    // The Chat / Terminal switch is a sibling of the chat view root, so it needs the guard too.
-    for (const target of [app._chatView.root, app._chatView.toggle]) {
-      for (const type of ['dragover', 'drop']) {
-        const ev = new win.Event(type, { bubbles: true, cancelable: true });
-        target.dispatchEvent(ev);
-        expect(ev.defaultPrevented).toBe(true);
-      }
+    // The switch is a sibling of the chat view root, whose own drop handler attaches the files.
+    for (const type of ['dragover', 'drop']) {
+      const ev = new win.Event(type, { bubbles: true, cancelable: true });
+      app._chatView.toggle.dispatchEvent(ev);
+      expect(ev.defaultPrevented).toBe(true);
     }
+  });
+
+  it('takes a file dropped on the conversation as an attachment, never letting the browser open it', () => {
+    const { win, app } = loadModule();
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    const attach = vi.spyOn(app, '_chatViewAttach').mockResolvedValue(undefined);
+    const file = new win.File(['x'], 'a.png', { type: 'image/png' });
+    for (const type of ['dragover', 'drop']) {
+      const ev = new win.Event(type, { bubbles: true, cancelable: true });
+      Object.defineProperty(ev, 'dataTransfer', { value: { types: ['Files'], files: [file] } });
+      app._chatView.root.dispatchEvent(ev);
+      expect(ev.defaultPrevented).toBe(true);
+    }
+    expect(attach).toHaveBeenCalledWith([file]);
   });
 
   it('hides the chat view, its switch and the body mark when the home screen shows', () => {
@@ -399,6 +468,601 @@ describe('chat view module', () => {
     expect(app._chatView.thread.children[0].textContent).toContain('log 19');
   });
 
+  it('sends through the HTTP input route with useMux, so the server presses and verifies Enter', async () => {
+    const { app } = loadModule();
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    app._chatView.input.value = 'line one\nline two  ';
+    await app._chatViewSend();
+    expect(app._api).toHaveBeenCalledTimes(1);
+    const [url, init] = app._api.mock.calls[0] as [string, { method: string; body: Record<string, unknown> }];
+    expect(url).toBe('/api/sessions/s1/input');
+    expect(init.method).toBe('POST');
+    expect(init.body).toMatchObject({ input: 'line one\nline two\r', useMux: true, seq: 1 });
+    expect(typeof init.body.clientId).toBe('string');
+    expect(app._chatView.input.value).toBe('');
+    expect(app._sendInputAsync).not.toHaveBeenCalled();
+  });
+
+  it('retries a failed request with the same clientId and seq, so the server applies it once', async () => {
+    vi.useFakeTimers();
+    try {
+      const { app } = loadModule();
+      app.setChatViewMode('s1', 'chat');
+      app.onChatViewActiveSession('s1');
+      app._api
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ success: true }) });
+      app._chatView.input.value = 'hello';
+      const sending = app._chatViewSend();
+      // The backoff before the second attempt.
+      await vi.advanceTimersByTimeAsync(600);
+      await sending;
+      expect(app._api).toHaveBeenCalledTimes(2);
+      const bodies = app._api.mock.calls.map((c) => (c[1] as { body: { clientId: string; seq: number } }).body);
+      expect(bodies[1].clientId).toBe(bodies[0].clientId);
+      expect(bodies[1].seq).toBe(bodies[0].seq);
+      expect(app._chatView.input.value).toBe('');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('gives each new prompt a new seq under the same clientId', async () => {
+    const { app } = loadModule();
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    app._chatView.input.value = 'first';
+    await app._chatViewSend();
+    app._chatView.input.value = 'second';
+    await app._chatViewSend();
+    const bodies = app._api.mock.calls.map((c) => (c[1] as { body: { clientId: string; seq: number } }).body);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].seq).toBe(1);
+    expect(bodies[1].seq).toBe(2);
+    expect(bodies[1].clientId).toBe(bodies[0].clientId);
+  });
+
+  it('sends on a bare Enter in the message box on a desktop', async () => {
+    const { win, app } = loadModule();
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    app._chatView.input.value = 'from the keyboard';
+    const ev = new win.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    app._chatView.input.dispatchEvent(ev);
+    await settle();
+    expect(ev.defaultPrevented).toBe(true);
+    expect(app._api).toHaveBeenCalledTimes(1);
+    expect(app._api).toHaveBeenCalledWith('/api/sessions/s1/input', expect.anything());
+  });
+
+  it('adds a line at the caret on Alt+Enter in the message box', async () => {
+    const { win, app } = loadModule();
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    const input = app._chatView.input;
+    input.value = 'ab';
+    input.setSelectionRange(1, 1);
+    const ev = new win.KeyboardEvent('keydown', { key: 'Enter', altKey: true, bubbles: true, cancelable: true });
+    input.dispatchEvent(ev);
+    await settle();
+    expect(ev.defaultPrevented).toBe(true);
+    expect(input.value).toBe('a\nb');
+    const drafts = (app as unknown as { _chatViewDrafts: () => Map<string, string> })._chatViewDrafts();
+    expect(drafts.get('s1')).toBe('a\nb');
+    expect(app._api).not.toHaveBeenCalled();
+  });
+
+  it('lets the primary pointer decide what a bare Enter does, not a touchscreen alone', async () => {
+    const { win, app } = loadModule();
+    // A touchscreen laptop: it has touch points, but its main pointer is fine.
+    win.MobileDetection = {
+      isHandheldDevice: () => false,
+      getDeviceType: () => 'desktop',
+      isTouchDevice: () => true,
+    };
+    let coarse = false;
+    win.matchMedia = ((query: string) => ({ matches: coarse && query === '(pointer: coarse)' })) as never;
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    expect(app._chatView.input.placeholder).toBe('Message Claude (Enter to send, Shift+Enter for a new line)');
+    app._chatView.input.value = 'from the laptop';
+    const enter = () => {
+      const ev = new win.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+      app._chatView.input.dispatchEvent(ev);
+      return ev;
+    };
+    expect(enter().defaultPrevented).toBe(true);
+    await settle();
+    expect(app._api).toHaveBeenCalledTimes(1);
+
+    // A tablet: the main pointer is touch, so a bare Enter adds a line.
+    coarse = true;
+    (app as unknown as { _chatViewSync: () => void })._chatViewSync();
+    expect(app._chatView.input.placeholder).toBe('Message Claude');
+    app._chatView.input.value = 'from the tablet';
+    expect(enter().defaultPrevented).toBe(false);
+    await settle();
+    expect(app._api).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows a sent prompt at once, below the conversation, until the transcript has it', async () => {
+    const before: Msg[] = [{ role: 'user', text: 'Hi', turn: 1 }];
+    const working: Msg[] = [...before, { role: 'assistant', text: 'Hello.', turn: 1 }];
+    const after: Msg[] = [...working, { role: 'user', text: 'Next question', turn: 2 }];
+    const { app } = loadModule({ messages: [before, working, after] });
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    await settle();
+
+    let resolvePost: (v: unknown) => void = () => {};
+    app._api.mockImplementationOnce(() => new Promise((r) => (resolvePost = r)));
+    app._chatView.input.value = 'Next question';
+    const sending = app._chatViewSend();
+    // Drawn before the request has even answered, and the box is already empty.
+    const pending = app._chatView.thread.querySelector('.chat-view-msg-pending') as HTMLElement;
+    // Drawn exactly as the transcript will draw it: no "sending" marker of any kind.
+    expect(pending.textContent).toBe('Next question');
+    expect(app._chatView.input.value).toBe('');
+    resolvePost({ ok: true, status: 200, json: async () => ({ success: true }) });
+    await sending;
+    expect(pending.textContent).toBe('Next question');
+
+    // An answer that lands first is drawn ABOVE the pending prompt.
+    await app._chatViewFetch();
+    const kids = Array.from(app._chatView.thread.children);
+    expect(kids[kids.length - 1]).toBe(pending);
+    expect(kids[kids.length - 2].textContent).toBe('Hello.');
+
+    // It was sent while "Hi" had no answer yet, so it was drawn as a continuation (no badge);
+    // the answer then landed first, which gives it a turn and a badge of its own.
+    expect(pending.classList.contains('rv-msg-cont')).toBe(true);
+
+    // Once the transcript has the prompt, the drawn element BECOMES the real message: the same
+    // node stays where it is, and only its badge is corrected.
+    await app._chatViewFetch();
+    expect(pending.classList.contains('rv-msg-cont')).toBe(false);
+    expect(pending.querySelector('.rv-role')!.textContent).toBe('You');
+    expect(app._chatView.thread.querySelector('.chat-view-msg-pending')).toBeNull();
+    const after2 = Array.from(app._chatView.thread.children);
+    expect(after2[after2.length - 1]).toBe(pending);
+    expect(
+      after2.map((el) => el.querySelector('.rv-text')?.textContent).filter((t) => t === 'Next question')
+    ).toHaveLength(1);
+  });
+
+  it('lets an unconfirmed pending prompt go after its turn ends', async () => {
+    const { app } = loadModule({ messages: [[{ role: 'user', text: 'Hi', turn: 1 }]] });
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    await settle();
+    app._chatView.input.value = 'something Claude never records';
+    await app._chatViewSend();
+    const view = app._chatView as unknown as { pending: { postedAt: number }[] };
+    expect(view.pending).toHaveLength(1);
+    view.pending[0].postedAt -= 5000;
+    (app as unknown as { onChatViewTurnEvent: (id: string, idle: boolean) => void }).onChatViewTurnEvent('s1', true);
+    await app._chatViewFetch();
+    expect(app._chatView.thread.querySelector('.chat-view-msg-pending')).toBeNull();
+  });
+
+  it('keeps a sent prompt that starts with / once the transcript records it as a prompt', async () => {
+    vi.useFakeTimers();
+    try {
+      const text = '/home/me/app.log why';
+      const before: Msg[] = [
+        { role: 'user', text: 'Hi', turn: 1 },
+        { role: 'assistant', text: 'Hello.', turn: 1 },
+      ];
+      const { app } = loadModule({ messages: [before, [...before, { role: 'user', text, turn: 2 }]] });
+      app.setChatViewMode('s1', 'chat');
+      app.onChatViewActiveSession('s1');
+      await vi.advanceTimersByTimeAsync(0);
+      app._chatView.input.value = text;
+      await app._chatViewSend();
+      // The re-read after the send finds the prompt in the transcript and keeps the drawn element.
+      await vi.advanceTimersByTimeAsync(300);
+      const el = app._chatView.thread.lastElementChild as HTMLElement;
+      expect(el.textContent).toBe(text);
+      expect(el.classList.contains('chat-view-msg-pending')).toBe(false);
+      // The timer that lets an unrecorded slash command go must leave the real message alone.
+      await vi.advanceTimersByTimeAsync(4000);
+      expect(el.parentElement).toBe(app._chatView.thread);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a sent /compact drawn for as long as its turn runs, until the transcript records it', async () => {
+    vi.useFakeTimers();
+    try {
+      const before: Msg[] = [
+        { role: 'user', text: 'Hi', turn: 1 },
+        { role: 'assistant', text: 'Hello.', turn: 1 },
+      ];
+      const { app } = loadModule({ messages: [before] });
+      app.setChatViewMode('s1', 'chat');
+      app.onChatViewActiveSession('s1');
+      await vi.advanceTimersByTimeAsync(0);
+      app._chatView.input.value = '/compact';
+      await app._chatViewSend();
+      app.sessions.get('s1')!.status = 'busy';
+      await vi.advanceTimersByTimeAsync(60_000);
+      const pending = app._chatView.thread.querySelector('.chat-view-msg-pending') as HTMLElement;
+      expect(pending?.textContent).toBe('/compact');
+
+      // Claude writes the command row only when the compaction ends, a minute or more later.
+      const after = [...before, { role: 'user', text: '/compact', turn: 2 }];
+      (app as unknown as { _apiJson: unknown })._apiJson = vi.fn(async () => ({ messages: after }));
+      app.sessions.get('s1')!.status = 'idle';
+      (app as unknown as { onChatViewTurnEvent: (id: string, idle: boolean) => void }).onChatViewTurnEvent('s1', true);
+      await vi.advanceTimersByTimeAsync(300);
+      expect(pending.parentElement).toBe(app._chatView.thread);
+      expect(pending.classList.contains('chat-view-msg-pending')).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('lets a sent slash command go after a few seconds when it started no turn and was not recorded', async () => {
+    vi.useFakeTimers();
+    try {
+      const { app } = loadModule();
+      app.setChatViewMode('s1', 'chat');
+      app.onChatViewActiveSession('s1');
+      await vi.advanceTimersByTimeAsync(0);
+      app._chatView.input.value = '/btw is the build green?';
+      await app._chatViewSend();
+      expect(app._chatView.thread.querySelector('.chat-view-msg-pending')).not.toBeNull();
+      await vi.advanceTimersByTimeAsync(4000);
+      expect(app._chatView.thread.querySelector('.chat-view-msg-pending')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('sends nothing while a dialog waits in the pane, and keeps the text', async () => {
+    const { win, app } = loadModule();
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    app.pendingHooks.set('s1', new Set(['permission_prompt']));
+    app.onChatViewHooksChanged('s1');
+    const input = app._chatView.input;
+    input.value = 'yes, do it';
+    input.dispatchEvent(new win.Event('input'));
+    expect(app._chatView.sendBtn.disabled).toBe(true);
+
+    await app._chatViewSend();
+    input.dispatchEvent(new win.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    await settle();
+    expect(app._api).not.toHaveBeenCalled();
+    expect(input.value).toBe('yes, do it');
+    expect(app._chatView.thread.querySelector('.chat-view-msg-pending')).toBeNull();
+    expect(app.showToast).toHaveBeenCalledWith('Claude is waiting for your answer in the terminal.', 'warning');
+
+    // The dialog was answered: Send works again.
+    app.pendingHooks.delete('s1');
+    app.onChatViewHooksChanged('s1');
+    expect(app._chatView.sendBtn.disabled).toBe(false);
+    await app._chatViewSend();
+    expect(app._api).toHaveBeenCalledWith('/api/sessions/s1/input', expect.anything());
+  });
+
+  it('keeps the text and says why when the server refuses the message', async () => {
+    const { app } = loadModule();
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    app._api.mockResolvedValueOnce({ ok: false, status: 400, json: async () => ({ error: 'Input too long' }) });
+    app._chatView.input.value = 'hello';
+    await app._chatViewSend();
+    expect(app._api).toHaveBeenCalledTimes(1);
+    expect(app._chatView.input.value).toBe('hello');
+    expect(app._chatView.thread.querySelector('.chat-view-msg-pending')).toBeNull();
+    expect(app.showToast).toHaveBeenCalledWith('Message not sent: Input too long', 'error');
+  });
+
+  it('puts the text back and says to check the connection when every attempt fails', async () => {
+    vi.useFakeTimers();
+    try {
+      const { app } = loadModule();
+      app.setChatViewMode('s1', 'chat');
+      app.onChatViewActiveSession('s1');
+      app._api.mockResolvedValue(null);
+      app._chatView.input.value = 'hello';
+      const sending = app._chatViewSend();
+      expect(app._chatView.thread.querySelector('.chat-view-msg-pending')).not.toBeNull();
+      await vi.advanceTimersByTimeAsync(2000);
+      await sending;
+      expect(app._api).toHaveBeenCalledTimes(3);
+      expect(app._chatView.thread.querySelector('.chat-view-msg-pending')).toBeNull();
+      expect(app._chatView.input.value).toBe('hello');
+      expect(app.showToast).toHaveBeenCalledWith('Message not sent. Check the connection and try again.', 'error');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps both a failed message and what was typed while it was being sent', async () => {
+    vi.useFakeTimers();
+    try {
+      const { app } = loadModule();
+      app.setChatViewMode('s1', 'chat');
+      app.onChatViewActiveSession('s1');
+      app._api.mockResolvedValue(null);
+      app._chatView.input.value = 'the failed one';
+      const sending = app._chatViewSend();
+      app._chatView.input.value = 'next';
+      await vi.advanceTimersByTimeAsync(2000);
+      await sending;
+      expect(app._chatView.input.value).toBe('the failed one\n\nnext');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a failed message across a view switch that bypasses the session change (the tile grid)', async () => {
+    vi.useFakeTimers();
+    try {
+      const { app } = loadModule();
+      const sync = (app as unknown as { _chatViewSync: () => void })._chatViewSync.bind(app);
+      app.setChatViewMode('s1', 'chat');
+      app.setChatViewMode('s5', 'chat');
+      app.onChatViewActiveSession('s1');
+      app._api.mockResolvedValue(null);
+      app._chatView.input.value = 'hello';
+      const sending = app._chatViewSend();
+      await vi.advanceTimersByTimeAsync(2000);
+      await sending;
+      expect(app._chatView.input.value).toBe('hello');
+
+      // tile-grid.js syncs the chat view directly, without onChatViewActiveSession.
+      app.activeSessionId = 's5';
+      sync();
+      expect(app._chatView.input.value).toBe('');
+      app.activeSessionId = 's1';
+      sync();
+      expect(app._chatView.input.value).toBe('hello');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('aborts a send attempt that never answers, so the message box never stays locked', async () => {
+    vi.useFakeTimers();
+    try {
+      const { app } = loadModule();
+      app.setChatViewMode('s1', 'chat');
+      app.onChatViewActiveSession('s1');
+      // A request that settles only when its signal aborts, as fetch does.
+      app._api.mockImplementation(
+        (_path: string, opts: { signal: AbortSignal }) =>
+          new Promise((resolve) => opts.signal.addEventListener('abort', () => resolve(null)))
+      );
+      app._chatView.input.value = 'hello';
+      const sending = app._chatViewSend();
+      // Three attempts of 15 s each, with 0.6 s and 1.2 s of backoff between them.
+      await vi.advanceTimersByTimeAsync(3 * 15_000 + 600 + 1200);
+      await sending;
+      expect(app._api).toHaveBeenCalledTimes(3);
+      expect((app._chatView as unknown as { sending: boolean }).sending).toBe(false);
+      expect(app._chatView.input.value).toBe('hello');
+      expect(app.showToast).toHaveBeenCalledWith('Message not sent. Check the connection and try again.', 'error');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('refuses a message over the input frame limit, and keeps it', async () => {
+    const { win, app } = loadModule();
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    const limit = (win as unknown as { CodemanInputLimit: { FRAME_MAX_CHARS: number } }).CodemanInputLimit
+      .FRAME_MAX_CHARS;
+    const long = 'x'.repeat(limit + 1);
+    app._chatView.input.value = long;
+    await app._chatViewSend();
+    expect(app._api).not.toHaveBeenCalled();
+    expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('Message too long to send'), 'error');
+    expect(app._chatView.input.value).toBe(long);
+    expect(app._chatView.thread.querySelector('.chat-view-msg-pending')).toBeNull();
+  });
+
+  it('keeps each of two identical prompts drawn until the transcript has a copy for each', async () => {
+    vi.useFakeTimers();
+    try {
+      const before: Msg[] = [
+        { role: 'user', text: 'Hi', turn: 1 },
+        { role: 'assistant', text: 'Hello.', turn: 1 },
+      ];
+      const one: Msg[] = [...before, { role: 'user', text: 'same', turn: 2 }];
+      const two: Msg[] = [...one, { role: 'user', text: 'same', turn: 2 }];
+      const { app } = loadModule({ messages: [before, one, two] });
+      app.setChatViewMode('s1', 'chat');
+      app.onChatViewActiveSession('s1');
+      await vi.advanceTimersByTimeAsync(0);
+      app._chatView.input.value = 'same';
+      await app._chatViewSend();
+      app._chatView.input.value = 'same';
+      await app._chatViewSend();
+      const [first, second] = Array.from(app._chatView.thread.querySelectorAll('.chat-view-msg-pending'));
+      expect(second).toBeDefined();
+
+      // The transcript holds one copy: it is the first prompt's, and the second stays pending.
+      await vi.advanceTimersByTimeAsync(300);
+      expect(first.classList.contains('chat-view-msg-pending')).toBe(false);
+      expect(second.classList.contains('chat-view-msg-pending')).toBe(true);
+      expect(second.parentElement).toBe(app._chatView.thread);
+
+      // Then two copies: the second is adopted too.
+      await app._chatViewFetch();
+      expect(second.classList.contains('chat-view-msg-pending')).toBe(false);
+      expect(second.parentElement).toBe(app._chatView.thread);
+      const texts = Array.from(app._chatView.thread.querySelectorAll('.rv-text')).map((el) => el.textContent);
+      expect(texts.filter((t) => t === 'same')).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives an adopted prompt the transcript row's queued marker", async () => {
+    const before: Msg[] = [{ role: 'user', text: 'Hi', turn: 1 }];
+    const after: Msg[] = [...before, { role: 'user', text: 'and this too', turn: 1, queued: true }];
+    const { app } = loadModule({ messages: [before, after] });
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    await settle();
+    app._chatView.input.value = 'and this too';
+    await app._chatViewSend();
+    const pending = app._chatView.thread.querySelector('.chat-view-msg-pending') as HTMLElement;
+    expect(pending.dataset.queued).toBeUndefined();
+    await app._chatViewFetch();
+    expect(pending.classList.contains('chat-view-msg-pending')).toBe(false);
+    expect(pending.dataset.queued).toBe('1');
+  });
+
+  it("gives an adopted prompt the transcript row's kind", async () => {
+    const before: Msg[] = [{ role: 'user', text: 'Hi', turn: 1 }];
+    const after: Msg[] = [...before, { role: 'user', text: 'what next', turn: 2, kind: 'prompt' }];
+    const { app } = loadModule({ messages: [before, after] });
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    await settle();
+    app._chatView.input.value = 'what next';
+    await app._chatViewSend();
+    const pending = app._chatView.thread.querySelector('.chat-view-msg-pending') as HTMLElement;
+    expect(pending.dataset.kind).toBeUndefined();
+    await app._chatViewFetch();
+    expect(pending.classList.contains('chat-view-msg-pending')).toBe(false);
+    expect(pending.dataset.kind).toBe('prompt');
+  });
+
+  it('shows the text it sends in the pending prompt, without paste markers, CRs or trailing space', async () => {
+    const before: Msg[] = [{ role: 'user', text: 'Hi', turn: 1 }];
+    const after: Msg[] = [...before, { role: 'user', text: 'line one\nline two', turn: 2 }];
+    const { app } = loadModule({ messages: [before, after] });
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    await settle();
+    app._chatView.input.value = 'line one\r\nline\x1b[201~ two  ';
+    await app._chatViewSend();
+    const pending = app._chatView.thread.querySelector('.chat-view-msg-pending') as HTMLElement;
+    expect(pending.querySelector('.rv-text')?.textContent).toBe('line one\nline two');
+    const posts = app._api.mock.calls as unknown as [string, { body?: { input?: string } }][];
+    const post = posts.find(([url]) => url.endsWith('/input'));
+    expect(post?.[1].body?.input).toBe('line one\nline two\r');
+    // The transcript records the same text, so the pending copy is adopted as the real message.
+    await app._chatViewFetch();
+    expect(pending.classList.contains('chat-view-msg-pending')).toBe(false);
+    expect(pending.parentElement).toBe(app._chatView.thread);
+  });
+
+  it('keeps a pending prompt through an idle event that came during its send or just after it', async () => {
+    const { app } = loadModule({ messages: [[{ role: 'user', text: 'Hi', turn: 1 }]] });
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    await settle();
+
+    // An idle event just after the send, well inside CHAT_VIEW_IDLE_GRACE_MS.
+    app._chatView.input.value = 'just sent';
+    await app._chatViewSend();
+    app.onChatViewTurnEvent('s1', true);
+    await app._chatViewFetch();
+    expect(app._chatView.thread.querySelector('.chat-view-msg-pending')?.textContent).toBe('just sent');
+
+    // An idle event while the request is still in flight (postedAt 0).
+    let resolvePost: (v: unknown) => void = () => {};
+    app._api.mockImplementationOnce(() => new Promise((r) => (resolvePost = r)));
+    app._chatView.input.value = 'in flight';
+    const sending = app._chatViewSend();
+    app.onChatViewTurnEvent('s1', true);
+    resolvePost({ ok: true, status: 200, json: async () => ({ success: true }) });
+    await sending;
+    await app._chatViewFetch();
+    const texts = Array.from(app._chatView.thread.querySelectorAll('.chat-view-msg-pending')).map(
+      (el) => el.textContent
+    );
+    expect(texts).toContain('in flight');
+  });
+
+  it('lets an idle event drop a pending prompt only once CHAT_VIEW_IDLE_GRACE_MS has passed since its send', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-24T12:00:00Z'));
+    try {
+      const { app } = loadModule({ messages: [[{ role: 'user', text: 'Hi', turn: 1 }]] });
+      app.setChatViewMode('s1', 'chat');
+      app.onChatViewActiveSession('s1');
+      await vi.advanceTimersByTimeAsync(0);
+      const pendingTexts = () =>
+        Array.from(app._chatView.thread.querySelectorAll('.chat-view-msg-pending')).map((el) => el.textContent);
+
+      // 1999 ms after the send, the prompt may still be on its way into the transcript.
+      app._chatView.input.value = 'kept';
+      await app._chatViewSend();
+      vi.setSystemTime(Date.now() + 1999);
+      app.onChatViewTurnEvent('s1', true);
+      await app._chatViewFetch();
+      expect(pendingTexts()).toContain('kept');
+
+      // 2000 ms after the send, a finished turn that did not record it lets it go.
+      app._chatView.input.value = 'expired';
+      await app._chatViewSend();
+      vi.setSystemTime(Date.now() + 2000);
+      app.onChatViewTurnEvent('s1', true);
+      await app._chatViewFetch();
+      expect(pendingTexts()).not.toContain('expired');
+      // Stop the status line's ticking before the real clock comes back.
+      app.setChatViewMode('s1', 'terminal');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps an unsent draft per session, and forgets it with the session', () => {
+    const { app } = loadModule();
+    app.setChatViewMode('s1', 'chat');
+    app.setChatViewMode('s5', 'chat');
+    app.onChatViewActiveSession('s1');
+    const input = app._chatView.input;
+    input.value = 'draft A';
+    input.dispatchEvent(new input.ownerDocument.defaultView!.Event('input'));
+
+    app.activeSessionId = 's5';
+    app.onChatViewActiveSession('s5');
+    expect(input.value).toBe('');
+    app.activeSessionId = 's1';
+    app.onChatViewActiveSession('s1');
+    expect(input.value).toBe('draft A');
+
+    app._chatViewForget('s1');
+    const drafts = (app as unknown as { _chatViewDrafts: () => Map<string, string> })._chatViewDrafts();
+    expect(drafts.has('s1')).toBe(false);
+  });
+
+  it('adds dictated text to the message box, after a space', () => {
+    const { win, app } = loadModule();
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    const a = app as unknown as {
+      _chatViewInsertText: (t: string) => void;
+      _chatViewDrafts: () => Map<string, string>;
+    };
+    // An empty box has nothing to send, and the box does not hold the focus yet.
+    app._chatView.input.blur();
+    expect(win.document.activeElement).not.toBe(app._chatView.input);
+    expect(app._chatView.sendBtn.disabled).toBe(true);
+    a._chatViewInsertText('hello');
+    expect(app._chatView.input.value).toBe('hello');
+    // A value set by script fires no input event, so the insert itself turns Send on and
+    // focuses the box.
+    expect(app._chatView.sendBtn.disabled).toBe(false);
+    expect(win.document.activeElement).toBe(app._chatView.input);
+    a._chatViewInsertText('world');
+    expect(app._chatView.input.value).toBe('hello world');
+    expect(a._chatViewDrafts().get('s1')).toBe('hello world');
+    expect(app._api).not.toHaveBeenCalled();
+    expect(app._sendInputAsync).not.toHaveBeenCalled();
+  });
+
   it('puts the Working line right under the last message, inside the scrolling list', () => {
     const { app } = loadModule();
     app.setChatViewMode('s1', 'chat');
@@ -456,7 +1120,7 @@ describe('chat view module', () => {
     }
   });
 
-  it("shows no status line during Codeman's keep-alive turn", () => {
+  it("shows no status line and no Stop button during Codeman's keep-alive turn", () => {
     const { app } = loadModule();
     app.setChatViewMode('s1', 'chat');
     app.onChatViewActiveSession('s1');
@@ -464,15 +1128,47 @@ describe('chat view module', () => {
     session.status = 'busy';
     app.onChatViewTurnEvent('s1', false, true);
     expect(app._chatView.status.hidden).toBe(true);
+    expect(app._chatView.stopBtn.hidden).toBe(true);
 
     session.status = 'idle';
     app.onChatViewTurnEvent('s1', true, true);
-    // A real turn shows it again.
+    // A real turn shows both again.
     session.status = 'busy';
     app.onChatViewTurnEvent('s1', false);
     expect(app._chatView.status.hidden).toBe(false);
+    expect(app._chatView.stopBtn.hidden).toBe(false);
     session.status = 'idle';
     app.onChatViewTurnEvent('s1', true);
+  });
+
+  it("makes a running keep-alive turn the user's once a prompt is sent into it", async () => {
+    const { app } = loadModule();
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    const session = app.sessions.get('s1')!;
+    session.status = 'busy';
+    app.onChatViewTurnEvent('s1', false, true);
+    expect(app._chatView.stopBtn.hidden).toBe(true);
+
+    app._chatView.input.value = 'my own prompt';
+    await app._chatViewSend();
+    const a = app as unknown as { _chatViewBusy: (id: string) => boolean };
+    expect(a._chatViewBusy('s1')).toBe(true);
+    expect(app._chatView.stopBtn.hidden).toBe(false);
+    expect(app._chatView.status.hidden).toBe(false);
+    session.status = 'idle';
+    app.onChatViewTurnEvent('s1', true);
+  });
+
+  it('interrupts the running turn with Esc from the Stop button', () => {
+    const { app } = loadModule();
+    app.sessions.get('s1')!.status = 'busy';
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    expect(app._chatView.stopBtn.hidden).toBe(false);
+    app._chatView.stopBtn.click();
+    expect(app._sendInputAsync).toHaveBeenCalledWith('s1', '\x1b');
+    app.setChatViewMode('s1', 'terminal');
   });
 
   /** A Chat session that is busy, on a device that is touch or not, with app.js's focus rule. */
@@ -488,6 +1184,8 @@ describe('chat view module', () => {
       getDeviceType: () => (touch ? 'tablet' : 'desktop'),
       isTouchDevice: () => touch,
     };
+    // The message box reads the primary pointer; a tablet's is coarse.
+    win.matchMedia = ((query: string) => ({ matches: touch && query === '(pointer: coarse)' })) as never;
     win.KeyboardHandler = { keyboardVisible: false };
     app.sessions.get('s1')!.status = 'busy';
     app.setChatViewMode('s1', 'terminal');
@@ -495,12 +1193,15 @@ describe('chat view module', () => {
   }
   const nextFrame = (win: Window) => new Promise<void>((r) => win.requestAnimationFrame(() => r()));
 
-  it('follows the tab-switch focus rule on a touch device: no focus on a switch to Chat', async () => {
+  it('keeps the on-screen keyboard down on a touch device: no focus on a switch to Chat or on Stop', async () => {
     const { win, app } = loadForFocus(true);
     app.setChatViewMode('s1', 'chat');
     app.onChatViewActiveSession('s1');
     await nextFrame(win);
-    expect(win.document.activeElement).not.toBe(app._chatView.scroller);
+    expect(win.document.activeElement).not.toBe(app._chatView.input);
+    app._chatView.stopBtn.click();
+    expect(app._sendInputAsync).toHaveBeenCalledWith('s1', '\x1b');
+    expect(win.document.activeElement).not.toBe(app._chatView.input);
   });
 
   it('moves a focus left in the terminal to the conversation on a switch to Chat, on a touch device', async () => {
@@ -524,19 +1225,23 @@ describe('chat view module', () => {
     expect(win.document.activeElement).toBe(app._chatView.scroller);
   });
 
-  it('focuses the conversation on a desktop, on a switch to Chat', async () => {
+  it('focuses the message box on a desktop, on a switch to Chat and after Stop', async () => {
     const { win, app } = loadForFocus(false);
     app.setChatViewMode('s1', 'chat');
     app.onChatViewActiveSession('s1');
     await nextFrame(win);
-    expect(win.document.activeElement).toBe(app._chatView.scroller);
+    expect(win.document.activeElement).toBe(app._chatView.input);
+    app._chatView.input.blur();
+    app._chatView.stopBtn.click();
+    expect(win.document.activeElement).toBe(app._chatView.input);
   });
 
-  it('unfolds a long prompt in place, with the badge it was drawn with', () => {
+  it('unfolds a long prompt with the badge it shows now, not the one it was drawn with', () => {
     const { win, app } = loadModule();
     const a = app as unknown as {
       _buildResponseViewerMessage: (t: string, r: string, l: string, m?: { continuation?: boolean }) => HTMLElement;
       _chatViewBuildMessage: (m: Msg, label: string, continuation: boolean) => HTMLElement;
+      _chatViewSetUserBadge: (el: HTMLElement, badge: boolean) => void;
     };
     // As the real builder does: a prompt that is not a continuation carries its "You" badge.
     const build = a._buildResponseViewerMessage;
@@ -552,11 +1257,62 @@ describe('chat view module', () => {
     const long = Array.from({ length: 30 }, (_, i) => `line ${i}`).join('\n');
     const el = a._chatViewBuildMessage({ role: 'user', text: long, turn: 1 }, 'Claude', true);
     expect(el.classList.contains('rv-msg-cont')).toBe(true);
+    a._chatViewSetUserBadge(el, true);
     (el.querySelector('.chat-view-show-all') as HTMLButtonElement).click();
-    expect(el.querySelector(':scope > .rv-role')).toBeNull();
-    expect(el.classList.contains('rv-msg-cont')).toBe(true);
-    expect(el.querySelector('.chat-view-show-all')).toBeNull();
-    expect(el.textContent).toContain('line 29');
+    expect(el.querySelector(':scope > .rv-role')).not.toBeNull();
+    expect(el.classList.contains('rv-msg-cont')).toBe(false);
+
+    // A continuation prompt drawn without a badge stays without one once unfolded.
+    const cont = a._chatViewBuildMessage({ role: 'user', text: long, turn: 1 }, 'Claude', true);
+    (cont.querySelector('.chat-view-show-all') as HTMLButtonElement).click();
+    expect(cont.classList.contains('rv-msg-cont')).toBe(true);
+    expect(cont.querySelector(':scope > .rv-role')).toBeNull();
+    expect(cont.textContent).toContain('line 29');
+  });
+
+  it('uploads attached files and puts their paths in the message box, never in the pane', async () => {
+    const { win, app } = loadModule();
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    const file = new win.File(['x'], 'a.png', { type: 'image/png' });
+    app._admitPromptAttachments = vi.fn((files: File[]) => files);
+    app._uploadAndInsertImages = vi.fn(async () => ['/w/.codeman-uploads/a.png']);
+    app._chatView.input.value = 'look at';
+    await app._chatViewAttach([file]);
+    expect(app._uploadAndInsertImages).toHaveBeenCalledWith([file], { insert: false, sessionId: 's1' });
+    expect(app._chatView.input.value).toBe('look at /w/.codeman-uploads/a.png ');
+  });
+
+  it('uploads a pasted screenshot like an attached file, and leaves a plain text paste to the browser', async () => {
+    const { win, app } = loadModule();
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    const file = new win.File(['x'], 'image.png', { type: 'image/png' });
+    app._admitPromptAttachments = vi.fn((files: File[]) => files);
+    app._uploadAndInsertImages = vi.fn(async () => ['/w/.codeman-uploads/image.png']);
+    const paste = (items: { getAsFile: () => File | null }[], text: string) => {
+      const ev = new win.Event('paste', { bubbles: true, cancelable: true });
+      Object.defineProperty(ev, 'clipboardData', { value: { items, getData: () => text } });
+      app._chatView.input.dispatchEvent(ev);
+      return ev;
+    };
+
+    const textOnly = paste([{ getAsFile: () => null }], 'just text');
+    expect(textOnly.defaultPrevented).toBe(false);
+    expect(app._uploadAndInsertImages).not.toHaveBeenCalled();
+
+    const shot = paste([{ getAsFile: () => file }], '');
+    expect(shot.defaultPrevented).toBe(true);
+    expect(app._admitPromptAttachments).toHaveBeenCalledWith([file], { textPasted: false });
+    await settle();
+    expect(app._uploadAndInsertImages).toHaveBeenCalledWith([file], { insert: false, sessionId: 's1' });
+    expect(app._chatView.input.value).toBe('/w/.codeman-uploads/image.png ');
+
+    // A file the attach rules refuse is not uploaded, and the paste goes on as text.
+    app._admitPromptAttachments = vi.fn(() => []);
+    const refused = paste([{ getAsFile: () => file }], 'name.exe');
+    expect(refused.defaultPrevented).toBe(false);
+    expect(app._uploadAndInsertImages).toHaveBeenCalledTimes(1);
   });
 
   it('shows the waiting notice while a permission prompt or question is pending', () => {
