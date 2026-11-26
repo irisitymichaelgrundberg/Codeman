@@ -216,6 +216,33 @@ describe('ClaudeTranscriptReader', () => {
     expect((await reader.read(file)).skills).toEqual([{ name: 'three', description: 'about three', kind: 'skill' }]);
   });
 
+  it('names an idle compaction once, even when its notice first arrives without its newline', async () => {
+    const boundary = JSON.stringify({
+      type: 'system',
+      subtype: 'compact_boundary',
+      compactMetadata: { trigger: 'auto' },
+    });
+    const notice = JSON.stringify({
+      type: 'system',
+      subtype: 'informational',
+      content: 'Compacted while idle · set idleCompaction to turn this off',
+    });
+    writeFileSync(file, `${user('p')}\n${assistant('a')}\n${boundary}\n`);
+    const reader = new ClaudeTranscriptReader();
+    const before = await reader.read(file);
+    appendFileSync(file, notice);
+    const unfinished = await reader.read(file);
+    appendFileSync(file, '\n');
+    const finished = await reader.read(file);
+    const compactions = (r: typeof before) => r.messages.filter((m) => m.compaction).map((m) => [m.compaction, m.text]);
+    expect(compactions(before)).toEqual([['auto', 'Conversation compacted']]);
+    expect(compactions(unfinished)).toEqual([['idle', 'Compacted while idle']]);
+    expect(compactions(finished)).toEqual([['idle', 'Compacted while idle']]);
+    expect(finished).toEqual(
+      parseClaudeResponseTranscript(`${user('p')}\n${assistant('a')}\n${boundary}\n${notice}\n`)
+    );
+  });
+
   it('rejects for a missing file, and reads it once it exists', async () => {
     const reader = new ClaudeTranscriptReader();
     await expect(reader.read(file)).rejects.toThrow();

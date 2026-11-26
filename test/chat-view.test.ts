@@ -38,7 +38,9 @@ interface ChatHelpers {
   promptText: (t: string) => string;
   promptCount: (m: Msg[], t: string) => number;
   pendingConfirmed: (p: { text: string; baseline: number }, m: Msg[]) => boolean;
+  activity: (tool?: string, detail?: string, workingDir?: string, command?: string) => string;
   elapsed: (ms: number) => string;
+  compacting: (rows: unknown) => boolean;
   enterSends: (ev: Record<string, unknown>, touch: boolean) => boolean;
   sendPayload: (v: string) => string | null;
   slashQuery: (value: string, caret?: number) => string | null;
@@ -74,6 +76,20 @@ describe('CodemanChatView helpers', () => {
     expect(h.renderPlan([], ['a'])).toEqual({ mode: 'append', from: 0 });
     expect(h.renderPlan(['a', 'b'], ['a', 'x', 'c'])).toEqual({ mode: 'replace' });
     expect(h.renderPlan(['a', 'b'], ['a'])).toEqual({ mode: 'replace' });
+  });
+
+  it("reads a compaction off Claude's working line, and nowhere else on the screen", () => {
+    const box = ['────────────', '❯ ', '────────────', '  ⏵⏵ auto mode on'];
+    // As measured on Claude Code 2.1.332: the working line, then a tip row indented under it.
+    expect(h.compacting(['· Compacting conversation… (0s · ↓ 4 tokens)', '  ⎿  Tip: Run /focus', ...box])).toBe(true);
+    expect(h.compacting(['✽ Compacting conversation… (1s)', '', ...box])).toBe(true);
+    // An ordinary turn, and an answer that quotes the line above Claude's newest row.
+    expect(h.compacting(['✻ Reticulating… (4s · esc to interrupt)', ...box])).toBe(false);
+    expect(h.compacting(['✻ Compacting conversation… (2s)', '● It printed that line.', ...box])).toBe(false);
+    // Text typed into the box is not the working line, and a screen with no box says nothing.
+    expect(h.compacting(['● Done.', '────────────', '❯ ✻ Compacting conversation… (2s)', '────────────'])).toBe(false);
+    expect(h.compacting(['✻ Compacting conversation… (2s)'])).toBe(false);
+    expect(h.compacting(undefined)).toBe(false);
   });
 
   it('keys a message by role, turn and text', () => {
@@ -131,6 +147,22 @@ describe('CodemanChatView helpers', () => {
     expect(h.pendingConfirmed({ text: 'again', baseline: 1 }, msgs)).toBe(false);
     expect(h.pendingConfirmed({ text: 'again', baseline: 0 }, msgs)).toBe(true);
     expect(h.pendingConfirmed({ text: 'missing', baseline: 0 }, msgs)).toBe(false);
+  });
+
+  it('says what the agent is doing the way the CLI does, with workspace paths made relative', () => {
+    expect(h.activity(undefined, '', '/w')).toBe('Working');
+    expect(h.activity('Read', '/w/src/a.ts', '/w')).toBe('Reading src/a.ts');
+    expect(h.activity('Read', '/w/src/a.ts', '/w/')).toBe('Reading src/a.ts');
+    expect(h.activity('Read', '/other/a.ts', '/w')).toBe('Reading /other/a.ts');
+    expect(h.activity('Edit', '/w/app.js', '/w')).toBe('Editing app.js');
+    expect(h.activity('Bash', 'npm test', '/w')).toBe('Running npm test');
+    expect(h.activity('Grep', 'TODO in src', '/w')).toBe('Searching for TODO in src');
+    expect(h.activity('Task', '', '/w')).toBe('Running agent');
+    expect(h.activity('TodoWrite', '', '/w')).toBe('Updating the to-do list');
+    expect(h.activity('mcp__db__query', 'select 1', '/w')).toBe('mcp__db__query: select 1');
+    expect(h.activity('SomethingNew', '', '/w')).toBe('SomethingNew');
+    // A described command: the description alone, as the CLI's headline.
+    expect(h.activity('Bash', 'Listing changes', '/w', 'git diff')).toBe('Listing changes');
   });
 
   it('formats the running time like the CLI', () => {
@@ -530,6 +562,25 @@ describe('chat view module', () => {
     expect(app._chatView.thread.children[0].textContent).toContain('log 19');
   });
 
+  it("draws a compaction as a divider, and keeps Claude's badge on the reply after it", async () => {
+    const messages: (Msg & { compaction?: string })[] = [
+      { role: 'user', text: 'Go on', turn: 1 },
+      { role: 'assistant', text: 'Working on it.', turn: 1 },
+      { role: 'assistant', text: 'Compacted while idle, before the prompt cache expired', turn: 1, compaction: 'idle' },
+      { role: 'assistant', text: 'Done.', turn: 1 },
+    ];
+    const { app } = loadModule({ messages: [messages] });
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    await settle();
+    const nodes = Array.from(app._chatView.thread.children) as HTMLElement[];
+    expect(nodes).toHaveLength(4);
+    expect(nodes[2].className).toBe('chat-view-divider');
+    expect(nodes[2].getAttribute('role')).toBe('separator');
+    expect(nodes[2].textContent).toBe('Compacted while idle, before the prompt cache expired');
+    expect(nodes[3].classList.contains('rv-msg-cont')).toBe(false);
+  });
+
   it("keeps Claude's badge on a reply that follows a `!` command's output in the same turn", async () => {
     const messages: (Msg & { shellOutput?: boolean })[] = [
       { role: 'user', text: 'Look at the build', turn: 1 },
@@ -795,6 +846,57 @@ describe('chat view module', () => {
       expect(app._chatView.thread.querySelector('.chat-view-msg-pending')).not.toBeNull();
       await vi.advanceTimersByTimeAsync(4000);
       expect(app._chatView.thread.querySelector('.chat-view-msg-pending')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("says the conversation is being compacted, while Claude's working line says so", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-24T12:00:00Z'));
+    try {
+      const { app } = loadModule();
+      app.setChatViewMode('s1', 'chat');
+      app.onChatViewActiveSession('s1');
+      const a = app as unknown as {
+        onChatViewTurnEvent: (id: string, idle: boolean) => void;
+        _onChatViewToolStart: (d: Record<string, string>) => void;
+        _chatView: { statusText: HTMLElement; statusSub: HTMLElement };
+      };
+      app.sessions.set('s1', { id: 's1', mode: 'claude', status: 'busy', workingDir: '/work' });
+      a.onChatViewTurnEvent('s1', false);
+      // A tool from earlier in the turn: auto-compaction can start in the middle of one.
+      a._onChatViewToolStart({ sessionId: 's1', toolName: 'Bash', detail: 'Run the tests', command: 'npm test' });
+      // The main terminal shows the session's screen; the chat view reads the working line off it.
+      const screen = [
+        '● Reading the logs.',
+        '✻ Compacting conversation… (3s · ↓ 341 tokens)',
+        '  ⎿  Tip: Just want the answer? Run /focus now to hide the steps along the way',
+        '────────────────────────────────',
+        '❯ ',
+        '────────────────────────────────',
+        '  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt',
+      ];
+      const rows = { current: screen };
+      (app as unknown as { terminal: unknown }).terminal = {
+        focus: vi.fn(),
+        buffer: {
+          active: {
+            get length() {
+              return rows.current.length;
+            },
+            getLine: (y: number) => ({ translateToString: () => rows.current[y] }),
+          },
+        },
+      };
+      app.onChatViewActiveSession('s1');
+      expect(a._chatView.statusText.textContent).toBe('Compacting conversation · 0s');
+      expect(a._chatView.statusSub.hidden).toBe(true);
+
+      rows.current = ['✻ Compacting conversation… (9s)', '⏺ Compacted.', '────────', '❯ ', '────────'];
+      app.onChatViewActiveSession('s1');
+      expect(a._chatView.statusText.textContent).toBe('Run the tests · 0s');
+      app.setChatViewMode('s1', 'terminal');
     } finally {
       vi.useRealTimers();
     }
@@ -1151,29 +1253,187 @@ describe('chat view module', () => {
     expect(view.thread.nextElementSibling).toBe(view.status);
   });
 
+  it('shows the running tool and what it works on, with the turn time', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-24T12:00:00Z'));
+    try {
+      const { app } = loadModule();
+      app.setChatViewMode('s1', 'chat');
+      app.onChatViewActiveSession('s1'); // idle: this page sees the turn begin
+      app.sessions.set('s1', { id: 's1', mode: 'claude', status: 'busy', workingDir: '/work' });
+      const a = app as unknown as {
+        onChatViewTurnEvent: (id: string, idle: boolean) => void;
+        _onChatViewToolStart: (d: Record<string, string>) => void;
+        _chatView: { status: HTMLElement; statusText: HTMLElement; statusSub: HTMLElement; statusTimer: unknown };
+      };
+      a.onChatViewTurnEvent('s1', false);
+      a._onChatViewToolStart({ sessionId: 's1', toolName: 'Read', detail: '/work/src/session.ts' });
+      expect(a._chatView.status.hidden).toBe(false);
+      expect(a._chatView.statusText.textContent).toBe('Reading src/session.ts · 0s');
+      expect(a._chatView.statusTimer).not.toBeNull();
+      expect(a._chatView.statusSub.hidden).toBe(true);
+
+      // A described command: the description is the headline and the command goes under it.
+      a._onChatViewToolStart({
+        sessionId: 's1',
+        toolName: 'Bash',
+        detail: 'Listing every changed region',
+        command: 'git diff -U0 -- .docs/plans',
+      });
+      expect(a._chatView.statusText.textContent).toBe('Listing every changed region · 0s');
+      expect(a._chatView.statusSub.hidden).toBe(false);
+      expect(a._chatView.statusSub.textContent).toBe('$ git diff -U0 -- .docs/plans');
+
+      // The clock is the test's: the running time is exactly what passed.
+      vi.advanceTimersByTime(5000);
+      expect(a._chatView.statusText.textContent).toBe('Listing every changed region · 5s');
+
+      app.sessions.set('s1', { id: 's1', mode: 'claude', status: 'idle', workingDir: '/work' });
+      a.onChatViewTurnEvent('s1', true);
+      expect(a._chatView.status.hidden).toBe(true);
+      expect(a._chatView.statusTimer).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops naming a tool once it ends, and says Working until the next one', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-24T12:00:00Z'));
+    try {
+      const { app } = loadModule();
+      app.setChatViewMode('s1', 'chat');
+      app.onChatViewActiveSession('s1');
+      app.sessions.set('s1', { id: 's1', mode: 'claude', status: 'busy', workingDir: '/work' });
+      const a = app as unknown as {
+        onChatViewTurnEvent: (id: string, idle: boolean) => void;
+        _onChatViewToolStart: (d: Record<string, string>) => void;
+        _onChatViewToolEnd: (d: Record<string, unknown>) => void;
+        _chatView: { statusText: HTMLElement; statusSub: HTMLElement };
+      };
+      a.onChatViewTurnEvent('s1', false);
+      a._onChatViewToolStart({ sessionId: 's1', toolName: 'Bash', detail: 'Run the tests', command: 'npm test' });
+      expect(a._chatView.statusText.textContent).toBe('Run the tests · 0s');
+
+      a._onChatViewToolEnd({ sessionId: 's1', toolName: 'Bash', isError: false });
+      expect(a._chatView.statusText.textContent).toBe('Working · 0s');
+      expect(a._chatView.statusSub.hidden).toBe(true);
+      app.setChatViewMode('s1', 'terminal');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("opens the next turn on Working, not on the last turn's tool", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-24T12:00:00Z'));
+    try {
+      const { app } = loadModule();
+      app.setChatViewMode('s1', 'chat');
+      app.onChatViewActiveSession('s1');
+      app.sessions.set('s1', { id: 's1', mode: 'claude', status: 'busy', workingDir: '/work' });
+      const a = app as unknown as {
+        onChatViewTurnEvent: (id: string, idle: boolean) => void;
+        _onChatViewToolStart: (d: Record<string, string>) => void;
+        _chatView: { statusText: HTMLElement };
+      };
+      a.onChatViewTurnEvent('s1', false);
+      a._onChatViewToolStart({ sessionId: 's1', toolName: 'Read', detail: '/work/src/session.ts' });
+      expect(a._chatView.statusText.textContent).toBe('Reading src/session.ts · 0s');
+
+      // The turn ends with no tool end for the Read, and a new turn starts.
+      app.sessions.set('s1', { id: 's1', mode: 'claude', status: 'idle', workingDir: '/work' });
+      a.onChatViewTurnEvent('s1', true);
+      app.sessions.set('s1', { id: 's1', mode: 'claude', status: 'busy', workingDir: '/work' });
+      a.onChatViewTurnEvent('s1', false);
+      expect(a._chatView.statusText.textContent?.startsWith('Working')).toBe(true);
+      expect(a._chatView.statusText.textContent).not.toContain('Reading');
+      app.setChatViewMode('s1', 'terminal');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('finds the compaction line on a tall terminal whose content does not fill the screen', () => {
+    const { app } = loadModule();
+    // 60 rows: the conversation and Claude's working line, rule and message box at rows 12-15,
+    // then 44 blank rows below them.
+    const rows: string[] = Array.from({ length: 60 }, () => '');
+    rows[0] = '● Reading the logs.';
+    rows[12] = '✻ Compacting conversation… (3s)';
+    rows[13] = '────────────────────────────────';
+    rows[14] = '❯ ';
+    rows[15] = '────────────────────────────────';
+    (app as unknown as { terminal: unknown }).terminal = {
+      focus: vi.fn(),
+      buffer: {
+        active: {
+          length: rows.length,
+          getLine: (y: number) => ({ translateToString: () => rows[y] }),
+        },
+      },
+    };
+    expect((app as unknown as { _chatViewCompacting: () => boolean })._chatViewCompacting()).toBe(true);
+  });
+
+  it('says what still runs in the background between turns, without a running time', () => {
+    const { win, app } = loadModule();
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    const status = app._chatView.root.querySelector('.chat-view-status') as HTMLElement;
+    expect(status.hidden).toBe(true);
+
+    app.sessions.get('s1')!.watching = '1 shell';
+    app.onChatViewActiveSession('s1');
+    expect(status.hidden).toBe(false);
+    expect(status.classList.contains('chat-view-status--background')).toBe(true);
+    expect(status.querySelector('.chat-view-status-text')!.textContent).toBe('1 shell still running');
+    // The count comes from the CLI's screen, so only the words after it go through the translator.
+    const w = win as unknown as { CodemanI18n?: unknown };
+    w.CodemanI18n = { t: (text: string) => (text === 'still running' ? 'X' : text) };
+    try {
+      app.onChatViewActiveSession('s1');
+      expect(status.querySelector('.chat-view-status-text')!.textContent).toBe('1 shell X');
+    } finally {
+      delete w.CodemanI18n;
+    }
+
+    // A new turn takes the line back; the background wording goes once the work ends.
+    app.sessions.get('s1')!.status = 'busy';
+    app.onChatViewActiveSession('s1');
+    expect(status.classList.contains('chat-view-status--background')).toBe(false);
+    app.sessions.get('s1')!.status = 'idle';
+    app.sessions.get('s1')!.watching = null;
+    app.onChatViewActiveSession('s1');
+    expect(status.hidden).toBe(true);
+  });
+
   it('counts a turn already running when the page loaded from the last Enter, not from the page load', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-11-24T12:00:00Z'));
-    const { app } = loadModule();
-    app.sessions.set('s1', {
-      id: 's1',
-      mode: 'claude',
-      status: 'busy',
-      workingDir: '/work',
-      lastSubmitAt: Date.now() - 73_000,
-    });
-    app.setChatViewMode('s1', 'chat');
-    const a = app as unknown as {
-      onChatViewTurnEvent: (id: string, idle: boolean) => void;
-      _chatView: { statusText: HTMLElement };
-    };
-    // A working event for a session this page never saw idle says nothing about the turn's start.
-    a.onChatViewTurnEvent('s1', false);
-    app.onChatViewActiveSession('s1');
-    expect(a._chatView.statusText.textContent).toBe('Working · 1m 13s');
-    // Stop the status line's ticking before the real clock comes back.
-    app.setChatViewMode('s1', 'terminal');
-    vi.useRealTimers();
+    try {
+      const { app } = loadModule();
+      app.sessions.set('s1', {
+        id: 's1',
+        mode: 'claude',
+        status: 'busy',
+        workingDir: '/work',
+        lastSubmitAt: Date.now() - 73_000,
+      });
+      app.setChatViewMode('s1', 'chat');
+      const a = app as unknown as {
+        onChatViewTurnEvent: (id: string, idle: boolean) => void;
+        _chatView: { statusText: HTMLElement };
+      };
+      // A working event for a session this page never saw idle says nothing about the turn's start.
+      a.onChatViewTurnEvent('s1', false);
+      app.onChatViewActiveSession('s1');
+      expect(a._chatView.statusText.textContent).toBe('Working · 1m 13s');
+      // Stop the status line's ticking before the real clock comes back.
+      app.setChatViewMode('s1', 'terminal');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('counts a turn this page saw start from its session:working event', () => {
@@ -1954,6 +2214,41 @@ describe('chat view slash commands that do more than send', () => {
   });
 });
 
+describe('chat view suggested prompt', () => {
+  it('shows the suggestion as the placeholder, fills it on Tab, and never sends it on its own', async () => {
+    const { app, win } = loadModule();
+    app.sessions.get('s1')!.promptSuggestion = 'commit and push it';
+    app.setChatViewMode('s1', 'chat');
+    app.onChatViewActiveSession('s1');
+    const input = app._chatView.input;
+    expect(input.placeholder).toBe('commit and push it');
+
+    const key = (k: string) => {
+      const ev = new win.KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true });
+      input.dispatchEvent(ev);
+      return ev;
+    };
+    key('Enter');
+    await settle();
+    expect(app._api).not.toHaveBeenCalled();
+
+    expect(key('Tab').defaultPrevented).toBe(true);
+    expect(input.value).toBe('commit and push it');
+
+    // With text in the box, Tab is left to the browser.
+    expect(key('Tab').defaultPrevented).toBe(false);
+
+    key('Enter');
+    await settle();
+    expect(app._api).toHaveBeenCalledWith(
+      '/api/sessions/s1/input',
+      expect.objectContaining({ body: expect.objectContaining({ input: 'commit and push it\r' }) })
+    );
+    // Sent: the suggestion is gone from the box at once.
+    expect(input.placeholder).toBe('Message Claude (Enter to send, Shift+Enter for a new line)');
+  });
+});
+
 describe('chat view wiring', () => {
   it("swallows the toggle chord in the xterm key handler and in Pane B's", () => {
     const terminalUi = read('terminal-ui.js');
@@ -2020,6 +2315,19 @@ describe('chat view wiring', () => {
     expect(escape).toMatch(
       /if \(e\.target\?\.classList\?\.contains\('chat-view-input'\) && this\._chatView\?\.slash\) \{\s*this\._chatViewSlashClose\(\);\s*return;/
     );
+  });
+
+  it('routes transcript:tool_start and transcript:tool_end to the chat view', () => {
+    const app = read('app.js');
+    const chatView = read('chat-view.js');
+    expect(app).toContain("[SSE_EVENTS.TRANSCRIPT_TOOL_START, '_onChatViewToolStart']");
+    expect(chatView).toContain('_onChatViewToolStart(');
+    // One handler per event in the map: a tool end reaches the Edit history panel and the chat view.
+    expect(app).toContain("[SSE_EVENTS.TRANSCRIPT_TOOL_END, '_onTranscriptToolEnd']");
+    expect(app).toMatch(
+      /\n {2}_onTranscriptToolEnd\(data\) \{\s*this\._onEditHistoryTranscriptEvent\(data\);\s*this\._onChatViewToolEnd\?\.\(data\);\s*\}/
+    );
+    expect(chatView).toContain('_onChatViewToolEnd(data) {');
   });
 
   it('passes the keep-alive flag of session:working and session:idle to the chat view', () => {

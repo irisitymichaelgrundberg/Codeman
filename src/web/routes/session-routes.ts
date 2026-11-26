@@ -3256,8 +3256,11 @@ export function registerSessionRoutes(
         return {
           text: parsed.text,
           timestamp: parsed.timestamp,
-          // A `!` command's output is no answer of Claude's, so a turn holding only that is unanswered.
-          messages: selectLastAnsweredTurn(parsed.messages.filter((message) => !message.shellOutput)),
+          // A `!` command's output and a compaction are no answer of Claude's, so a turn holding
+          // only those is unanswered.
+          messages: selectLastAnsweredTurn(
+            parsed.messages.filter((message) => !message.shellOutput && !message.compaction)
+          ),
         };
       }
       return wantsMessages

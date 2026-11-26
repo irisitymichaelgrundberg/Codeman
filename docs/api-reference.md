@@ -620,6 +620,13 @@ output, so a client can draw it without Claude's name. A command that printed no
 has no output message. Shell output never becomes the read's last response `text`, and it
 is never part of the `context=turn` read.
 
+A compaction reads as a `response` message with `compaction` set to `manual`, `auto`
+or `idle`, at the place in the conversation where it happened. Its text is Claude
+Code's own notice: "Conversation compacted", or for `idle` the notice Claude Code
+writes after a compaction it ran while the session waited. Claude wrote none of that
+text, so a client can draw it as a divider, and a compaction never becomes the read's
+last response `text`. A compaction is never part of the `context=turn` read either.
+
 A full read of a Claude transcript also starts a transcript watcher when none runs for
 the session. A watcher normally starts at the session's first hook or statusline report,
 so a session picked up after a server restart has none until one of those arrives. The
@@ -1223,6 +1230,21 @@ or 1000000 with extended context), absent until a report carries it and dropped,
 is stored as the window, and Session Options stops its two inputs there. The thresholds
 themselves are compared with the report's `context_window.total_input_tokens`, cache reads
 included, and with the session's token counter for a launch without the exporter.
+
+## Chat view state (`promptSuggestion`)
+
+One more optional field of session state (`GET /api/v1/sessions`, `session:updated`)
+feeds the chat view. It is written to `state.json` with the rest of the session state but
+never read back, and it is untrusted display text that a client must render as text.
+
+`promptSuggestion` is the next prompt Claude Code suggests in its empty composer. Claude
+Code draws it faint and writes it nowhere else, so the server reads it off the pane at
+about 1.5, 4 and 10 seconds after each turn ends. It reads only a Claude session that is
+neither remote nor adopted, and only while at least one client holds an SSE connection.
+The field is absent when there is none. Every submit clears it, including a command
+such as `/clear` that starts no turn, and so does a read that finds text typed into the
+composer. It changes through `session:updated`. A client should never send it without
+the user.
 
 ## Placing a new session in a tab group (`tabGroupId`)
 
@@ -1967,12 +1989,26 @@ the stable contract — event names are not renamed without a major bump. An
 optional `?sessions=<id,...>` filter suppresses only the high-volume terminal
 stream; lifecycle/metadata events are delivered to all clients regardless.
 
-### `transcript:update` (the chat view's re-read)
+### Events the chat view reads
 
-The server broadcasts `transcript:update` (`{ sessionId, timestamp }`) for a session whose
-transcript watcher runs, whenever new lines arrive in its transcript. It throttles the event
-to one per 750 ms per session. The first update after a quiet spell goes out at once, and a
-burst after it collapses into one trailing event.
+The server broadcasts these for a session whose transcript watcher runs:
+
+- `transcript:update` (`{ sessionId, timestamp }`) says new lines arrived in the
+  session's transcript. The server throttles it to one per 750 ms per session. The first
+  update after a quiet spell goes out at once, and a burst after it collapses into one
+  trailing event.
+- `transcript:tool_start` (`{ sessionId, toolName, detail?, command?, timestamp }`) says
+  a tool call began. `detail` names what the call works on, such as the file, the
+  command or the search pattern, and is absent when the input names nothing worth
+  showing. `command` is present only for a Bash call that also has a description, which
+  is then the `detail`. Each is one line. A longer value is cut at 160 characters and
+  ends with an ellipsis, so it is at most 161 characters long. The agent wrote both, so
+  render them as text.
+- `transcript:tool_end` (`{ sessionId, toolName, isError, timestamp }`) says a tool call
+  finished. The chat view then stops naming that tool.
+
+The chat view also re-reads the conversation on `session:working` and `session:idle`, and
+takes `promptSuggestion` from `session:updated`.
 
 ### `sse:heartbeat` (liveness)
 

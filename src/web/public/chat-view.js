@@ -16,7 +16,8 @@
  *   `showChatViewSwitch` is false (an absent key means shown). Hiding it changes nothing else:
  *   the session keeps its view, and Alt+Shift+C still switches.
  * - Live updates: the conversation is re-read (debounced) on the session's `transcript:update`,
- *   `session:working` and `session:idle`. Nothing is read while the chat view is hidden.
+ *   `session:working` and `session:idle`. `transcript:tool_start` names the running tool in the
+ *   status line. Nothing is read while the chat view is hidden.
  * - Sending: `POST /api/sessions/:id/input` with `useMux: true`, so the server pastes the text,
  *   presses Enter and re-presses it while the prompt still sits in Claude's composer. The
  *   browser's WebSocket path writes raw bytes and arms no such check. A `clientId` of this page
@@ -249,7 +250,11 @@ Object.assign(CodemanApp.prototype, {
     statusBody.className = 'chat-view-status-body';
     const statusText = document.createElement('div');
     statusText.className = 'chat-view-status-text';
-    statusBody.append(statusText);
+    // This line shows the command under a described Bash call, as the CLI draws it.
+    const statusSub = document.createElement('div');
+    statusSub.className = 'chat-view-status-sub';
+    statusSub.hidden = true;
+    statusBody.append(statusText, statusSub);
     status.append(statusDot, statusBody);
 
     const composer = document.createElement('form');
@@ -309,6 +314,7 @@ Object.assign(CodemanApp.prototype, {
 
     input.addEventListener('keydown', (ev) => {
       if (this._chatViewSlashKey(ev)) return;
+      if (this._chatViewUseSuggestion(ev)) return;
       // Firefox and Chromium insert nothing for Alt+Enter in a textarea, so the box adds the
       // line itself. The preventDefault also stops a second line where the browser does add one
       // (Option+Return on macOS), and the input event autosizes the box and saves the draft.
@@ -416,6 +422,7 @@ Object.assign(CodemanApp.prototype, {
       dialog,
       status,
       statusText,
+      statusSub,
       input,
       sendBtn,
       stopBtn,
@@ -530,9 +537,14 @@ Object.assign(CodemanApp.prototype, {
       this._chatViewAutosize();
     }
     const agent = this._getResponseViewerAgentLabel?.() || 'Claude';
-    view.input.placeholder = this._chatViewTouchPrimary()
-      ? this._chatViewT(`Message ${agent}`)
-      : this._chatViewT(`Message ${agent} (Enter to send, Shift+Enter for a new line)`);
+    // The CLI's suggested next prompt takes the placeholder, as it takes the CLI's empty composer;
+    // Tab fills it in (_chatViewUseSuggestion). It is never sent without the user.
+    const suggestion = this._chatViewSuggestion(id);
+    view.input.placeholder = suggestion
+      ? suggestion
+      : this._chatViewTouchPrimary()
+        ? this._chatViewT(`Message ${agent}`)
+        : this._chatViewT(`Message ${agent} (Enter to send, Shift+Enter for a new line)`);
     view.root.querySelector('.chat-view-dialog-text').textContent =
       `${agent} is waiting for your answer in the terminal.`;
     this._chatViewSyncDialog(id);
@@ -569,6 +581,7 @@ Object.assign(CodemanApp.prototype, {
     this._chatViewDrafts().delete(sessionId);
     this._chatViewPickerSessions?.delete(sessionId);
     this._chatViewClearedAfter?.delete(sessionId);
+    this._chatViewTools?.delete(sessionId);
     this._chatViewTurnStarts?.delete(sessionId);
     this._chatViewIdleSeen?.delete(sessionId);
     this._chatViewKeepAliveTurns?.delete(sessionId);
@@ -589,6 +602,28 @@ Object.assign(CodemanApp.prototype, {
     if (data?.sessionId && data.sessionId === this._chatView?.sessionId && this._chatViewShowing()) {
       this._chatViewReload();
     }
+  },
+
+  /** SSE `transcript:tool_start`: say in the status line what the running tool works on. */
+  _onChatViewToolStart(data) {
+    if (!data?.sessionId || typeof data.toolName !== 'string') return;
+    if (!this._chatViewTools) this._chatViewTools = new Map();
+    this._chatViewTools.set(data.sessionId, {
+      name: data.toolName,
+      detail: typeof data.detail === 'string' ? data.detail : '',
+      command: typeof data.command === 'string' ? data.command : '',
+    });
+    if (data.sessionId === this._chatView?.sessionId) this._chatViewRenderStatus();
+  },
+
+  /**
+   * SSE `transcript:tool_end`, through app.js `_onTranscriptToolEnd`: the tool finished, so the
+   * status line stops naming it and says "Working" until the next tool starts.
+   */
+  _onChatViewToolEnd(data) {
+    if (!data?.sessionId) return;
+    this._chatViewTools?.delete(data.sessionId);
+    if (data.sessionId === this._chatView?.sessionId) this._chatViewRenderStatus();
   },
 
   /**
@@ -612,6 +647,7 @@ Object.assign(CodemanApp.prototype, {
     if (idle) {
       this._chatViewIdleSeen.add(sessionId);
       this._chatViewTurnStarts.delete(sessionId);
+      this._chatViewTools?.delete(sessionId);
       // A prompt submitted before this turn ended is in the transcript by now, unless Claude
       // turned it into something it does not record as a prompt: the next draw lets it go.
       const now = Date.now();
@@ -661,23 +697,42 @@ Object.assign(CodemanApp.prototype, {
     if (!view) return;
     const session = this.sessions?.get(view.sessionId);
     const busy = this._chatViewBusy(view.sessionId);
-    // Keep the view pinned to the bottom when the status line appears under the last message,
-    // if the reader was already there.
+    // Between turns the agent can still have work running: a background shell, a monitor, a
+    // workflow. The server reads that off the CLI's screen (`watching`, e.g. "1 shell"), and the
+    // line says so the way the CLI's own turn-end line does.
+    const background = !busy && typeof session?.watching === 'string' && session.watching !== '';
+    // Keep the view pinned to the bottom when the status line appears or grows under the last
+    // message, if the reader was already there.
     const scroller = view.scroller;
     const atBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 48;
-    view.status.hidden = !busy;
+    view.status.hidden = !busy && !background;
+    view.status.classList.toggle('chat-view-status--background', background);
+    if (background) {
+      view.statusText.textContent = `${session.watching} ${this._chatViewT('still running')}`;
+      view.statusSub.hidden = true;
+      view.statusSub.textContent = '';
+    }
     if (!busy && view.sessionId) {
       if (!this._chatViewIdleSeen) this._chatViewIdleSeen = new Set();
       this._chatViewIdleSeen.add(view.sessionId);
     }
     if (busy) {
-      const activity = this._chatViewT('Working');
+      const helpers = window.CodemanChatView;
+      // A compaction runs no tools, and the last tool seen belongs to the turn before it.
+      const compacting = this._chatViewCompacting();
+      const tool = compacting ? undefined : this._chatViewTools?.get(view.sessionId);
+      const activity = compacting
+        ? this._chatViewT('Compacting conversation')
+        : helpers.activity(tool?.name, tool?.detail, session?.workingDir, tool?.command, (text) =>
+            // `{what}` maps to itself, so the template keeps its slot through interpolation.
+            this._chatViewT(text, { what: '{what}' })
+          );
       // The turn's start: seen live (session:working after idle), else the last Enter (a page
       // loaded mid-turn), else unknown and left out.
       const startedAt = this._chatViewTurnStarts?.get(view.sessionId) || session?.lastSubmitAt || 0;
-      view.statusText.textContent = startedAt
-        ? `${activity} · ${window.CodemanChatView.elapsed(Date.now() - startedAt)}`
-        : activity;
+      view.statusText.textContent = startedAt ? `${activity} · ${helpers.elapsed(Date.now() - startedAt)}` : activity;
+      view.statusSub.hidden = !tool?.command;
+      view.statusSub.textContent = tool?.command ? `$ ${tool.command}` : '';
     }
     // The running time ticks once a second, only while the status line is on screen.
     const ticking = busy && this._chatViewShowing();
@@ -687,6 +742,25 @@ Object.assign(CodemanApp.prototype, {
       view.statusTimer = null;
     }
     if (atBottom) scroller.scrollTop = scroller.scrollHeight;
+  },
+
+  /**
+   * Whether Claude's working line says it is compacting (CodemanChatView.compacting). The main
+   * terminal stays attached under the chat view and shows the active session, which is the one
+   * the chat view draws, so its buffer holds the screen Claude draws. Read on each status tick.
+   */
+  _chatViewCompacting() {
+    const buffer = this.terminal?.buffer?.active;
+    if (!buffer || typeof buffer.getLine !== 'function') return false;
+    // The window ends at the last row with text: on a tall terminal whose content does not fill
+    // the screen, Claude's working line sits far above the buffer's blank bottom rows.
+    let end = buffer.length - 1;
+    while (end > 0 && (buffer.getLine(end)?.translateToString(true) ?? '').trim() === '') end--;
+    const rows = [];
+    for (let y = Math.max(0, end - 39); y <= end; y++) {
+      rows.push(buffer.getLine(y)?.translateToString(true) ?? '');
+    }
+    return window.CodemanChatView.compacting(rows);
   },
 
   _chatViewSyncComposer() {
@@ -770,10 +844,12 @@ Object.assign(CodemanApp.prototype, {
       const msg = messages[i];
       const previous = i > 0 ? messages[i - 1] : null;
       // Same rule as the Response Viewer's full view: one badge per speaker per turn. A `!`
-      // command's output carries no badge, so a reply after it still shows Claude's.
+      // command's output and a compaction divider carry no badge, so a reply after either
+      // still shows Claude's.
       const continuation =
         !!previous &&
         !previous.shellOutput &&
+        !previous.compaction &&
         previous.role === msg.role &&
         typeof msg.turn === 'number' &&
         previous.turn === msg.turn;
@@ -791,6 +867,16 @@ Object.assign(CodemanApp.prototype, {
 
   /** One drawn message. A long prompt folds to its first lines. */
   _chatViewBuildMessage(msg, agentLabel, continuation) {
+    // A compaction is a line across the thread with Claude Code's own notice on it.
+    if (msg.compaction) {
+      const divider = document.createElement('div');
+      divider.className = 'chat-view-divider';
+      divider.setAttribute('role', 'separator');
+      const label = document.createElement('span');
+      label.textContent = msg.text;
+      divider.appendChild(label);
+      return divider;
+    }
     const meta = { ...msg, continuation };
     // The output of a `!` command belongs to the command above it: Claude wrote none of it, so
     // it gets no badge of Claude's.
@@ -932,6 +1018,31 @@ Object.assign(CodemanApp.prototype, {
       if (p.sessionId !== view.sessionId) continue;
       if (helpers.pendingConfirmed(p, view.lastMessages) || p.expireOnRender) this._chatViewDropPending(p);
     }
+  },
+
+  // ─── The suggested next prompt ───────────────────────────────
+
+  /** The CLI's suggested next prompt for `sessionId` (SessionState.promptSuggestion), or ''. */
+  _chatViewSuggestion(sessionId) {
+    const text = this.sessions?.get(sessionId)?.promptSuggestion;
+    return typeof text === 'string' ? text.trim() : '';
+  },
+
+  /**
+   * Tab in an empty message box puts the suggested next prompt in it, for the user to send or
+   * change. True when the key was used. Enter never sends a suggestion on its own.
+   */
+  _chatViewUseSuggestion(ev) {
+    const view = this._chatView;
+    if (!view || ev.key !== 'Tab' || ev.shiftKey || ev.altKey || ev.ctrlKey || ev.metaKey) return false;
+    if (view.input.value !== '') return false;
+    const suggestion = this._chatViewSuggestion(view.sessionId);
+    if (!suggestion) return false;
+    ev.preventDefault();
+    view.input.value = suggestion;
+    view.input.setSelectionRange(suggestion.length, suggestion.length);
+    view.input.dispatchEvent(new Event('input'));
+    return true;
   },
 
   // ─── Sending ─────────────────────────────────────────────────
@@ -1142,6 +1253,13 @@ Object.assign(CodemanApp.prototype, {
       this._chatViewAutosize();
     }
     this._chatViewDrafts().delete(sessionId);
+    // The CLI drops its suggestion when a prompt goes in; drop the page's copy now rather than
+    // when the turn's state arrives, so the box does not offer it again meanwhile.
+    const session = this.sessions?.get(sessionId);
+    if (session?.promptSuggestion) {
+      delete session.promptSuggestion;
+      if (view.sessionId === sessionId) this._chatViewSync();
+    }
     this._chatViewSyncComposer();
     let sent = false;
     let refusal = '';

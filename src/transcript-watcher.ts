@@ -366,7 +366,7 @@ export class TranscriptWatcher extends EventEmitter {
           // Tool started
           this.state.toolExecuting = true;
           this.state.currentTool = block.name;
-          this.emit('transcript:tool_start', block.name);
+          this.emit('transcript:tool_start', block.name, block.input);
         } else if (block.type === 'tool_result') {
           this.handleToolResult(block);
         }

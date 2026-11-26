@@ -663,6 +663,8 @@ export class Session extends EventEmitter {
   private _watching: string | null = null;
   /** Last `prompt_cache` report from the statusline exporter; null until Claude sends one. */
   private _promptCache: PromptCacheStatus | null = null;
+  /** The CLI's suggested next prompt, for the chat view (see SessionState.promptSuggestion). Runtime only. */
+  private _promptSuggestion = '';
   private _contextReport: ContextReport | null = null;
   /** Prompt-cache keep-warm opt-in; undefined = follow the app-wide default. Persisted. */
   private _keepWarmEnabled: boolean | undefined;
@@ -1794,6 +1796,18 @@ export class Session extends EventEmitter {
     return this._promptCache;
   }
 
+  /** The suggested next prompt read off the pane (prompt-suggestion-reader.ts); '' when none. */
+  get promptSuggestion(): string {
+    return this._promptSuggestion;
+  }
+
+  /** Replace the suggested next prompt; true when it changed (the caller broadcasts only a change). */
+  setPromptSuggestion(text: string): boolean {
+    if (text === this._promptSuggestion) return false;
+    this._promptSuggestion = text;
+    return true;
+  }
+
   /** Whether the current launch carries the statusLine exporter (`MuxSession.statusLine`); undefined when unknown. */
   get statusLineExporter(): StatusLineExporter | undefined {
     return this._muxSession?.statusLine;
@@ -2491,6 +2505,7 @@ export class Session extends EventEmitter {
       advisorModel: this._advisorModel,
       customModel: this.customModel,
       displayModel: this.displayModel,
+      promptSuggestion: this._promptSuggestion || undefined,
       // COD-118: runtime-only — surfaced so the frontend can require explicit user
       // intent before restarting a crash-looped session. Deliberately NOT restored
       // by the constructor: a Codeman restart starts with a fresh breaker so boot
@@ -5381,10 +5396,18 @@ export class Session extends EventEmitter {
     this._stampSubmit();
   }
 
-  /** Every submit moves `lastSubmitAt`; only one outside a keep-alive turn moves `lastRealPromptAt`. */
+  /**
+   * Every submit moves `lastSubmitAt`; only one outside a keep-alive turn moves `lastRealPromptAt`.
+   * Every submit also clears the suggested next prompt. A command that starts no turn (`/clear`)
+   * never reaches the reader's `onWorking`, and its suggestion belongs to the conversation before it.
+   */
   private _stampSubmit(): void {
     this._lastSubmitAt = Date.now();
     if (!this.keepAliveTurnActive) this._lastRealPromptAt = this._lastSubmitAt;
+    if (this._promptSuggestion !== '') {
+      this._promptSuggestion = '';
+      this.emit('promptSuggestionChanged');
+    }
   }
 
   /**

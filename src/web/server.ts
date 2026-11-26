@@ -83,6 +83,7 @@ import { attachmentRegistry, buildFileThumbnailRoute, registerExternalAttachment
 import { folderAllowedForUser, folderGrants } from '../folder-listing.js';
 import { isOutsideWorktreeRootRefused, loadAttachmentGuardConfig } from '../config/attachment-guard.js';
 import { getCli, enabledClis, listClis } from '../config/cli-registry/registry.js';
+import { toolStartPayload } from '../tool-call-summary.js';
 import { isCliEntryInstalled, probeStockCliAvailability } from '../utils/cli-installed-probes.js';
 import { readCustomModelHosts, resolveCustomModelContextLength } from '../custom-model-hosts.js';
 import {
@@ -133,6 +134,7 @@ import { agentInboxPersistence } from './agent-inbox-persistence.js';
 import { AI_CHECK_MODEL } from '../config/ai-defaults.js';
 import { approvalInbox } from './approval-inbox.js';
 import { SCREEN_BLOCKED_SOURCE } from './screen-blocked.js';
+import { PromptSuggestionReader, readPromptSuggestionFrame } from './prompt-suggestion-reader.js';
 import { PromptCacheKeepWarmService } from '../prompt-cache-keepwarm.js';
 import { fetchWorkspaceOnce } from '../git-fetch.js';
 import { GitFetchScheduler } from '../git-fetch-scheduler.js';
@@ -447,6 +449,24 @@ export class WebServer extends EventEmitter {
   private _customModelDisplacedNotified: Set<string> = new Set();
   /** Cron service (assigned in setupRoutes). */
   private cronService!: CronService;
+  // Claude Code's suggested next prompt, read off the pane after a turn ends, for the chat view
+  // (prompt-suggestion-reader.ts). Only sessions the chat view can show are read: a Claude-format
+  // transcript, a local pane, not adopted. Nothing is read while no browser holds an SSE
+  // connection, because each capture is synchronous and nobody would see the suggestion.
+  private readonly promptSuggestionReader = new PromptSuggestionReader({
+    read: (id) => {
+      const session = this.sessions.get(id);
+      return readPromptSuggestionFrame(
+        session,
+        session ? getCli(session.mode) : undefined,
+        (muxName, opts) => this.mux.capturePaneText?.(muxName, undefined, opts) ?? null
+      );
+    },
+    isIdle: (id) => this.sessions.get(id)?.status === 'idle',
+    hasViewers: () => this.sse.clientCount > 0,
+    publish: (id, text) => this.publishPromptSuggestion(id, text),
+  });
+
   // Prompt-cache keep-warm (prompt-cache-keepwarm.ts): the rulebook and timers live in the
   // service; the server only lends it the facts a decision needs. A field initializer, not a
   // setupRoutes() step: cleanup and listener wiring reach it on servers that never set up routes
@@ -1512,8 +1532,8 @@ export class WebServer extends EventEmitter {
         this.broadcast(SseEvent.TranscriptPlanMode, { sessionId, timestamp: Date.now() });
       });
 
-      watcher.on('transcript:tool_start', (toolName: string) => {
-        this.broadcast(SseEvent.TranscriptToolStart, { sessionId, toolName, timestamp: Date.now() });
+      watcher.on('transcript:tool_start', (toolName: string, input?: unknown) => {
+        this.broadcastToolStart(sessionId, toolName, input);
       });
 
       watcher.on('transcript:update', () => {
@@ -1563,6 +1583,14 @@ export class WebServer extends EventEmitter {
     } catch (err) {
       console.warn(`[IntentStore] Capture failed for session ${sessionId}:`, err);
     }
+  }
+
+  /**
+   * Broadcast `transcript:tool_start` for a session. The payload carries the tool's one-line
+   * `detail` and, for Bash, its `command`, which the chat view's status line shows.
+   */
+  private broadcastToolStart(sessionId: string, toolName: string, input: unknown): void {
+    this.broadcast(SseEvent.TranscriptToolStart, toolStartPayload(sessionId, toolName, input, Date.now()));
   }
 
   /** Broadcast `transcript:update` for a session, throttled (see `transcriptUpdateThrottle`). */
@@ -1762,6 +1790,7 @@ export class WebServer extends EventEmitter {
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     this.keepWarmService.remove(sessionId);
+    this.promptSuggestionReader.forget(sessionId);
     // A closed session takes its place in the fetch schedule with it: otherwise a detached-and-forgotten id
     // would still count as tracked, and its next run would land on a session that no longer exists.
     this.gitFetchScheduler.remove(sessionId);
@@ -2340,6 +2369,8 @@ export class WebServer extends EventEmitter {
     return {
       broadcast: this.broadcast.bind(this),
       keepWarmSchedule: (id: string) => void this.keepWarmService.schedule(id),
+      promptSuggestionIdle: (id: string) => this.promptSuggestionReader.onIdle(id),
+      promptSuggestionWorking: (id: string) => this.promptSuggestionReader.onWorking(id),
       batchTerminalData: this.batchTerminalData.bind(this),
       batchTaskUpdate: this.batchTaskUpdate.bind(this),
       broadcastSessionStateDebounced: this.broadcastSessionStateDebounced.bind(this),
@@ -3072,6 +3103,14 @@ export class WebServer extends EventEmitter {
 
   private broadcastSessionStateDebounced(sessionId: string): void {
     this.sse.broadcastSessionStateDebounced(sessionId);
+  }
+
+  /**
+   * Store a session's suggested next prompt ('' for none) and tell the pages when it changed.
+   * The prompt-suggestion reader's `publish` dependency.
+   */
+  private publishPromptSuggestion(sessionId: string, text: string): void {
+    if (this.sessions.get(sessionId)?.setPromptSuggestion(text)) this.broadcastSessionStateDebounced(sessionId);
   }
 
   /**
@@ -4774,6 +4813,7 @@ export class WebServer extends EventEmitter {
     sessionWaits.cancelEverything();
     approvalInbox.stop();
     this.keepWarmService.stop();
+    this.promptSuggestionReader.stop();
     // Stops the fetch sweep from starting another run while the server is closing; a git process already
     // running is left to finish, which is what a fetch does to a repository nothing else is touching.
     this.gitFetchScheduler.stop();

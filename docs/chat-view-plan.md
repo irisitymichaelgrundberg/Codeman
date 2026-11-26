@@ -54,6 +54,12 @@ stays attached under the chat view, so the chat view reads that line from the
 terminal's own buffer on each tick of the status line. Only Claude's newest row above
 its message box counts, so an answer that quotes the line does not.
 
+When a compaction ends, the thread shows a line across it at the place it happened.
+Claude Code writes a boundary row to the transcript for every compaction, and the line
+reads "Conversation compacted". Claude Code can also compact while the session waits,
+before the prompt cache expires. It then writes a notice after the boundary, and the
+line shows that notice: "Compacted while idle, before the prompt cache expired".
+
 Between turns, Claude can still run work in the background, such as a background
 shell or a monitor. The server reads that off Claude's screen as the session's
 `watching` value, and the status line then says so, for example "1 shell still
@@ -76,8 +82,9 @@ returns the whole conversation as prompt and response messages, each tagged with
 its turn number. The Response Viewer's "More" button uses it today, so the chat
 view needs no new reader for its first version.
 
-That reader keeps only text. It drops tool calls, tool results and thinking blocks,
-so in phase 1 the conversation shows prompts and answers only.
+That reader keeps only text and compactions. It drops tool calls, tool results and
+thinking blocks, so in phase 1 the conversation shows prompts, answers and a line at
+each compaction.
 
 Phase 2 adds a turn's tool activity as one muted summary line, such as
 "Read 9 files · edited 2 · ran 3 commands". A busy turn makes dozens of calls, and
@@ -319,8 +326,8 @@ is off.
    3. **Slash commands.** Add the `/` menu, draw a typed slash or `!` command as
       typed, and handle `/clear`, `/quit`, `/exit` and the picker commands.
    4. **What Claude is doing.** Name the running tool in the status line, say when
-      Claude compacts or still runs background work, and show the suggested next
-      prompt as the message box's placeholder.
+      Claude compacts or still runs background work, mark each compaction in the
+      thread, and show the suggested next prompt as the message box's placeholder.
    5. **The statusline** under the message box.
 2. **Dialogs and tool activity.** Show approval cards inline. Extend the transcript
    parser with tool messages and render each turn's calls as one expandable

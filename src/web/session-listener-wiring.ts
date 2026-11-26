@@ -45,6 +45,7 @@ export interface SessionListenerRefs {
   working: () => void;
   idle: () => void;
   watchingChanged: () => void;
+  promptSuggestionChanged: () => void;
   blockedChanged: (blocked: boolean, frame: string | null) => void;
   displayModelChanged: () => void;
   taskCreated: (task: BackgroundTask) => void;
@@ -99,6 +100,10 @@ interface SessionListenerDeps {
    * recovered pane is attached, so the restored report can arm its timer.
    */
   keepWarmSchedule?(sessionId: string): void;
+  /** Look for the CLI's suggested next prompt now that a turn ended (prompt-suggestion-reader.ts). */
+  promptSuggestionIdle?(sessionId: string): void;
+  /** A turn started, so the CLI dropped its suggested next prompt. */
+  promptSuggestionWorking?(sessionId: string): void;
 }
 
 /**
@@ -251,6 +256,7 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
       // open. `stop` was the first thing to clear it, which on a long turn is
       // minutes away.
       approvalInbox.resolveIfDialogGone(session.id);
+      deps.promptSuggestionWorking?.(session.id);
       // `keepAlive` tells the page this turn is Codeman's own keep-alive (stuck detection ignores it).
       deps.broadcast(SseEvent.SessionWorking, {
         id: session.id,
@@ -274,6 +280,7 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
       deps.broadcast(SseEvent.SessionIdle, { id: session.id, ...(session.keepAliveTurnActive && { keepAlive: true }) });
       deps.broadcastSessionStateDebounced(session.id);
       deps.keepWarmSchedule?.(session.id);
+      deps.promptSuggestionIdle?.(session.id);
       const tracker = deps.getRunSummaryTracker(session.id);
       if (tracker) {
         tracker.recordIdle();
@@ -289,6 +296,14 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
      * badge reads off the session payload every surface already has.
      */
     watchingChanged: () => {
+      deps.broadcastSessionStateDebounced(session.id);
+    },
+
+    /**
+     * Pushes the session state when a submit cleared the suggested next prompt. A command
+     * that starts no turn (`/clear`) leaves the status idle, so no other broadcast fires.
+     */
+    promptSuggestionChanged: () => {
       deps.broadcastSessionStateDebounced(session.id);
     },
 
@@ -550,6 +565,7 @@ export function attachSessionListeners(session: Session, refs: SessionListenerRe
   session.on('working', refs.working);
   session.on('idle', refs.idle);
   session.on('watchingChanged', refs.watchingChanged);
+  session.on('promptSuggestionChanged', refs.promptSuggestionChanged);
   session.on('blockedChanged', refs.blockedChanged);
   session.on('displayModelChanged', refs.displayModelChanged);
   session.on('taskCreated', refs.taskCreated);
@@ -589,6 +605,7 @@ export function detachSessionListeners(session: Session, refs: SessionListenerRe
   session.off('working', refs.working);
   session.off('idle', refs.idle);
   session.off('watchingChanged', refs.watchingChanged);
+  session.off('promptSuggestionChanged', refs.promptSuggestionChanged);
   session.off('blockedChanged', refs.blockedChanged);
   session.off('displayModelChanged', refs.displayModelChanged);
   session.off('taskCreated', refs.taskCreated);

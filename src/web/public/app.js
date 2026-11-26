@@ -285,13 +285,15 @@ const _SSE_HANDLER_MAP = [
   [SSE_EVENTS.IMAGE_DETECTED, '_onImageDetected'],
   [SSE_EVENTS.ATTACHMENT_DETECTED, '_onAttachmentDetected'],
 
-  // Edit history (edit-history-ui.js): an open panel follows its session's tool ends
-  // (and its turn ends, from _onSessionIdle: one handler per event in this map)
-  [SSE_EVENTS.TRANSCRIPT_TOOL_END, '_onEditHistoryTranscriptEvent'],
+  // A tool end goes to two handlers, through _onTranscriptToolEnd (one handler per event in this
+  // map): an open Edit history panel follows its session's tool ends (edit-history-ui.js; its
+  // turn ends come from _onSessionIdle), and the chat view's status line stops naming the tool.
+  [SSE_EVENTS.TRANSCRIPT_TOOL_END, '_onTranscriptToolEnd'],
 
-  // Chat view (chat-view.js): re-read the conversation as the transcript grows. Turn starts and
-  // ends reach it from _onSessionWorking / _onSessionIdle.
+  // Chat view (chat-view.js): re-read the conversation as the transcript grows, and name the
+  // running tool. Turn starts and ends reach it from _onSessionWorking / _onSessionIdle.
   [SSE_EVENTS.TRANSCRIPT_UPDATE, '_onChatViewTranscriptUpdate'],
+  [SSE_EVENTS.TRANSCRIPT_TOOL_START, '_onChatViewToolStart'],
 
   // Tunnel
   [SSE_EVENTS.TUNNEL_STARTED, '_onTunnelStarted'],
@@ -2994,7 +2996,8 @@ class CodemanApp {
    * The raw Markdown of the newest answer in a message list: every row of its
    * turn, or the last row when the reader emits no numeric turns (Codex, the
    * pane parser). Tool and status blocks share the assistant role but are not
-   * the answer, and neither is a `!` command's output, which Claude did not write.
+   * the answer. Neither is a `!` command's output, which Claude did not write, nor a
+   * compaction's notice, which Claude Code wrote.
    */
   _responseViewerMarkdownFrom(messages) {
     const answers = messages.filter(
@@ -3003,6 +3006,7 @@ class CodemanApp {
         msg.role === 'assistant' &&
         (!msg.kind || msg.kind === 'response') &&
         !msg.shellOutput &&
+        !msg.compaction &&
         msg.text?.trim()
     );
     const last = answers[answers.length - 1];
@@ -3328,7 +3332,9 @@ class CodemanApp {
     try {
       const res = await fetch(`/api/sessions/${this.activeSessionId}/last-response?context=full`);
       const data = (await res.json())?.data ?? {};
-      const messages = data.messages || [];
+      // The chat view draws a compaction as a divider. The Response Viewer shows none, so its
+      // notice never reads as a message Claude wrote.
+      const messages = (data.messages || []).filter((msg) => !msg?.compaction);
       const body = document.getElementById('responseViewerBody');
       const title = document.getElementById('responseViewerTitle');
       if (!body) return;
@@ -3697,6 +3703,12 @@ class CodemanApp {
         this.idleTimers.delete(data.id);
       }, threshold));
     }
+  }
+
+  /** SSE `transcript:tool_end`: the Edit history panel and the chat view both follow it. */
+  _onTranscriptToolEnd(data) {
+    this._onEditHistoryTranscriptEvent(data);
+    this._onChatViewToolEnd?.(data);
   }
 
   _onSessionWorking(data) {

@@ -42,6 +42,22 @@ describe('session listener wiring', () => {
     expect(broadcastSessionStateDebounced).toHaveBeenCalledWith('wiring-watching-test');
   });
 
+  it('pushes the session state when a submit clears the suggested next prompt', () => {
+    // A command that starts no turn (`/clear`) leaves the session idle, so no status
+    // broadcast would tell the pages their suggestion is gone.
+    const session = new Session({ id: 'wiring-suggestion-test', workingDir: '/tmp', mode: 'claude' });
+    const broadcastSessionStateDebounced = vi.fn();
+    const deps = { broadcastSessionStateDebounced } as unknown as Parameters<typeof createSessionListeners>[1];
+
+    const refs = createSessionListeners(session, deps);
+    attachSessionListeners(session, refs);
+    session.setPromptSuggestion('commit it');
+    session.write('/clear\r');
+
+    expect(broadcastSessionStateDebounced).toHaveBeenCalledWith('wiring-suggestion-test');
+    detachSessionListeners(session, refs);
+  });
+
   it('pushes and persists the session state when the reported model changes', () => {
     // A model switch changes nothing the status reflects, so without its own broadcast
     // every header would keep naming the old model; persisting it is what lets a restart
@@ -92,6 +108,29 @@ describe('session listener wiring', () => {
     const flag = keepAlive ? { keepAlive: true } : {};
     expect(broadcast).toHaveBeenCalledWith(SseEvent.SessionWorking, { id: session.id, ...flag });
     expect(broadcast).toHaveBeenCalledWith(SseEvent.SessionIdle, { id: session.id, ...flag });
+  });
+
+  it('starts the prompt-suggestion reader on idle and clears it on working', () => {
+    const session = new Session({ id: 'wiring-prompt-suggestion', workingDir: '/tmp', mode: 'claude' });
+    const promptSuggestionIdle = vi.fn();
+    const promptSuggestionWorking = vi.fn();
+    const deps = {
+      broadcast: vi.fn(),
+      broadcastSessionStateDebounced: vi.fn(),
+      getRunSummaryTracker: vi.fn(() => undefined),
+      promptSuggestionIdle,
+      promptSuggestionWorking,
+    } as unknown as Parameters<typeof createSessionListeners>[1];
+    const refs = createSessionListeners(session, deps);
+
+    refs.idle();
+    expect(promptSuggestionIdle).toHaveBeenCalledWith('wiring-prompt-suggestion');
+    expect(promptSuggestionWorking).not.toHaveBeenCalled();
+
+    refs.working();
+    expect(promptSuggestionWorking).toHaveBeenCalledWith('wiring-prompt-suggestion');
+    expect(promptSuggestionIdle).toHaveBeenCalledTimes(1);
+    approvalInbox.resolveForSession(session.id, 'dismissed');
   });
 
   /** The listener reads the setting asynchronously; let its promise chain settle. */

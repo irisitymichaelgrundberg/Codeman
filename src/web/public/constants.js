@@ -1602,6 +1602,75 @@ function chatViewPendingConfirmed(pending, messages) {
   return !!pending && chatViewPromptCount(messages, pending.text) > (pending.baseline || 0);
 }
 
+/** Each tool name maps to the verb phrase the CLI would show for it on the chat view's status line. */
+const CHAT_TOOL_VERBS = {
+  Read: 'Reading',
+  NotebookRead: 'Reading',
+  Write: 'Writing',
+  Edit: 'Editing',
+  MultiEdit: 'Editing',
+  NotebookEdit: 'Editing',
+  Bash: 'Running',
+  Grep: 'Searching for',
+  Glob: 'Finding',
+  WebFetch: 'Fetching',
+  WebSearch: 'Searching the web for',
+  Task: 'Running agent:',
+  Agent: 'Running agent:',
+  Skill: 'Using skill',
+};
+
+/**
+ * The status line's account of what the agent is doing: the tool as a verb, and what it works
+ * on (`detail`, from the server's `transcript:tool_start`), with a path inside the session's
+ * folder shown relative to it. A Bash call with a description (`command` set) shows the
+ * description alone. Before the first tool call of a turn, the line says "Working".
+ *
+ * `t` translates the line's fixed English parts. A verb with an object goes through it as a
+ * template with a `{what}` slot, so the agent's text never passes through the translator. A
+ * described command and an unknown tool's name are the agent's own text and stay as they are.
+ */
+function chatViewActivity(toolName, detail, workingDir, command, t = (text) => text) {
+  if (!toolName) return t('Working');
+  // A described command: the description is the headline, as in the CLI (the command goes on
+  // the line under it).
+  if (command && typeof detail === 'string' && detail) return detail;
+  if (toolName === 'TodoWrite') return t('Updating the to-do list');
+  let what = typeof detail === 'string' ? detail : '';
+  const base = typeof workingDir === 'string' ? workingDir.replace(/\/+$/, '') : '';
+  if (base && what.startsWith(`${base}/`)) what = what.slice(base.length + 1);
+  const verb = CHAT_TOOL_VERBS[toolName];
+  // A function replacement, so a `$` in a path stays literal.
+  if (verb) return what ? t(`${verb} {what}`).replace('{what}', () => what) : t(verb.replace(/:$/, ''));
+  return what ? `${toolName}: ${what}` : toolName;
+}
+
+/**
+ * Whether Claude's screen says it is compacting the conversation. Claude Code then draws
+ * `✻ Compacting conversation… (12s · ↓ 341 tokens)` as its working line, for `/compact` and for
+ * its own auto-compaction alike, and writes nothing to the transcript until the compaction ends.
+ * `rows` are the screen's rows, top to bottom. Only Claude's newest column-0 row above its
+ * message box counts, so an answer that quotes the line further up does not.
+ */
+function chatViewCompacting(rows) {
+  if (!Array.isArray(rows)) return false;
+  // The message box: a `❯` row with a rule row above it.
+  let rule = -1;
+  for (let i = rows.length - 1; i > 0; i--) {
+    if (/^❯/.test(rows[i] || '') && /^─{3,}/.test(rows[i - 1] || '')) {
+      rule = i - 1;
+      break;
+    }
+  }
+  for (let i = rule - 1; i >= 0; i--) {
+    const row = rows[i] || '';
+    // A blank row, or an indented one such as the `⎿  Tip:` row under the working line.
+    if (!row.trim() || /^\s/.test(row)) continue;
+    return /^\S Compacting conversation…/.test(row);
+  }
+  return false;
+}
+
 /** A running turn's length as the CLI shows it: `14s`, `2m 05s`, `1h 03m`. */
 function chatViewElapsed(ms) {
   const total = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
@@ -1799,6 +1868,8 @@ if (typeof window !== 'undefined') {
     promptText: chatViewPromptText,
     promptCount: chatViewPromptCount,
     pendingConfirmed: chatViewPendingConfirmed,
+    activity: chatViewActivity,
+    compacting: chatViewCompacting,
     elapsed: chatViewElapsed,
     enterSends: chatViewEnterSends,
     sendPayload: chatViewSendPayload,

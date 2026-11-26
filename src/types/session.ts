@@ -1182,6 +1182,14 @@ export interface SessionState {
    * value is restored after a restart until the next report replaces it.
    */
   displayModel?: DisplayModel;
+  /**
+   * The next prompt the CLI suggests in its empty composer (Claude Code draws it faint), read
+   * off the pane after a turn ends, for the chat view's message box. Absent when there is none,
+   * and cleared when a turn starts. Written to state.json with the rest of the session state,
+   * but never read back: the next turn end reads it again. Model text: render as text, never
+   * send it without the user.
+   */
+  promptSuggestion?: string;
   /** Sanitized per-session attachment history. */
   attachmentHistory?: SessionAttachmentHistoryItem[];
   /**

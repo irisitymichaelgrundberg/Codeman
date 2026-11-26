@@ -48,6 +48,12 @@ export interface ClaudeResponseMessage {
   keepAlive?: boolean;
   /** The output of a `!` command the user ran, as a fenced code block. Claude wrote none of it. */
   shellOutput?: boolean;
+  /**
+   * Where Claude Code compacted the conversation: `manual` (`/compact`), `auto`, or `idle` (an
+   * automatic compaction while the session waited, before the prompt cache expired). The text
+   * is Claude Code's own notice, and Claude wrote none of it.
+   */
+  compaction?: 'manual' | 'auto' | 'idle';
 }
 
 /**
@@ -68,6 +74,11 @@ interface ClaudeTranscriptEntry {
   isSidechain?: boolean;
   isCompactSummary?: boolean;
   message?: { content?: unknown };
+  // A `system` row: `compact_boundary` (with `compactMetadata.trigger`) marks a compaction, and
+  // `informational` carries a notice such as the idle-compaction one (measured on 2.1.331).
+  subtype?: string;
+  content?: unknown;
+  compactMetadata?: { trigger?: unknown };
   // A prompt typed while Claude is working is absorbed mid-turn and recorded
   // ONLY here — the CLI never re-emits it as a `user` row. Every field stays
   // optional and unvalidated: `queued_command` is not a documented CLI
@@ -104,6 +115,9 @@ function isClaudeSyntheticUserMessage(entry: ClaudeTranscriptEntry, text: string
     text
   );
 }
+
+/** Claude Code's notice after a compaction it ran while the session waited (2.1.331). */
+const IDLE_COMPACTION_NOTICE = /^Compacted while idle\b/;
 
 /**
  * Claude writes an append-only event log: tool results arrive as user rows,
@@ -229,6 +243,44 @@ export class ClaudeResponseParser {
       if (!text || isClaudeSyntheticUserMessage(entry, text)) return;
       if (this.currentUserFragments.has(text)) return;
       this.pushUserMessage(text, queued.timestamp || entry.timestamp, true);
+      return;
+    }
+
+    // A compaction is drawn where it happened. Claude Code follows an idle compaction's
+    // boundary row with a notice that says so, and the notice then names the boundary.
+    if (entry.type === 'system') {
+      if (entry.subtype === 'compact_boundary') {
+        this.messages.push({
+          kind: 'response',
+          label: 'Response',
+          role: 'assistant',
+          text: 'Conversation compacted',
+          timestamp: entry.timestamp,
+          turn: this.turn,
+          compaction: entry.compactMetadata?.trigger === 'manual' ? 'manual' : 'auto',
+        });
+        return;
+      }
+      const notice = typeof entry.content === 'string' ? entry.content : '';
+      if (entry.subtype !== 'informational' || !IDLE_COMPACTION_NOTICE.test(notice)) return;
+      // The notice goes on with a settings tip after a `·`, which Claude Code follows with a
+      // no-break space.
+      const text = notice.split(/\s+·\s+/)[0].trim();
+      const boundary = this.messages.at(-1);
+      if (boundary?.compaction === 'auto') {
+        // A new object, never an edit: an earlier answer and a clone share the old one.
+        this.messages[this.messages.length - 1] = { ...boundary, text, compaction: 'idle' };
+      } else {
+        this.messages.push({
+          kind: 'response',
+          label: 'Response',
+          role: 'assistant',
+          text,
+          timestamp: entry.timestamp,
+          turn: this.turn,
+          compaction: 'idle',
+        });
+      }
       return;
     }
 

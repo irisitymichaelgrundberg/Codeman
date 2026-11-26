@@ -138,6 +138,136 @@ describe('GET /api/sessions/:id/last-response (claude)', () => {
     ]);
   });
 
+  it('draws each compaction where it happened, naming an idle one with its notice', async () => {
+    const id = harness.ctx._session.id;
+    (harness.ctx._session as typeof harness.ctx._session & { claudeSessionId: string }).claudeSessionId = id;
+    harness.ctx._session.mode = 'claude';
+    // Claude Code 2.1.331's rows: a boundary, its summary as a user row, and after an idle
+    // compaction a notice two seconds later.
+    const boundary = (trigger: string) => ({
+      type: 'system',
+      subtype: 'compact_boundary',
+      content: 'Conversation compacted',
+      compactMetadata: { trigger, preTokens: 380000 },
+    });
+    writeTranscript(id, [
+      userEntry('Review the branch'),
+      assistantEntry('Done.', '2026-07-21T00:00:01Z'),
+      boundary('auto'),
+      userEntry('This session is being continued from a previous conversation.', { isCompactSummary: true }),
+      {
+        type: 'system',
+        subtype: 'informational',
+        level: 'notice',
+        content: 'Compacted while idle, before the prompt cache expired ·\u00a0turn off with "idleCompaction": false',
+      },
+      userEntry('Go on'),
+      assistantEntry('Going on.', '2026-07-21T00:00:02Z'),
+      boundary('manual'),
+      { type: 'system', subtype: 'informational', content: 'Unknown command: /clean. Did you mean /clear?' },
+    ]);
+    const full = await getLastResponse(id, true);
+    expect(
+      full.body.data.messages.map((m: { role: string; text: string; compaction?: string }) => [
+        m.role,
+        m.text,
+        m.compaction ?? null,
+      ])
+    ).toEqual([
+      ['user', 'Review the branch', null],
+      ['assistant', 'Done.', null],
+      ['assistant', 'Compacted while idle, before the prompt cache expired', 'idle'],
+      ['user', 'Go on', null],
+      ['assistant', 'Going on.', null],
+      ['assistant', 'Conversation compacted', 'manual'],
+    ]);
+    // A compaction is never Claude's last message.
+    expect((await getLastResponse(id)).body.data.text).toBe('Going on.');
+  });
+
+  it('draws an idle compaction notice on its own when no auto boundary comes before it', async () => {
+    const id = harness.ctx._session.id;
+    (harness.ctx._session as typeof harness.ctx._session & { claudeSessionId: string }).claudeSessionId = id;
+    harness.ctx._session.mode = 'claude';
+    writeTranscript(id, [
+      userEntry('Review the branch'),
+      assistantEntry('Done.', '2026-07-21T00:00:01Z'),
+      {
+        type: 'system',
+        subtype: 'informational',
+        level: 'notice',
+        content: 'Compacted while idle, before the prompt cache expired · turn off with "idleCompaction": false',
+      },
+    ]);
+    const full = await getLastResponse(id, true);
+    expect(
+      full.body.data.messages.map((m: { role: string; text: string; compaction?: string }) => [
+        m.role,
+        m.text,
+        m.compaction ?? null,
+      ])
+    ).toEqual([
+      ['user', 'Review the branch', null],
+      ['assistant', 'Done.', null],
+      ['assistant', 'Compacted while idle, before the prompt cache expired', 'idle'],
+    ]);
+    expect(full.body.data.text).toBe('Done.');
+  });
+
+  describe('a compaction is never part of the context=turn read', () => {
+    const boundary = (trigger: string) => ({
+      type: 'system',
+      subtype: 'compact_boundary',
+      content: 'Conversation compacted',
+      compactMetadata: { trigger, preTokens: 380000 },
+    });
+    const idleNotice = {
+      type: 'system',
+      subtype: 'informational',
+      level: 'notice',
+      content: 'Compacted while idle, before the prompt cache expired · turn off with "idleCompaction": false',
+    };
+
+    async function turnRead(entries: unknown[]) {
+      const id = harness.ctx._session.id;
+      (harness.ctx._session as typeof harness.ctx._session & { claudeSessionId: string }).claudeSessionId = id;
+      harness.ctx._session.mode = 'claude';
+      writeTranscript(id, entries);
+      const response = await harness.app.inject({
+        method: 'GET',
+        url: `/api/sessions/${id}/last-response?context=turn`,
+      });
+      return JSON.parse(response.body).data as {
+        text: string;
+        messages: Array<{ role: string; text: string; compaction?: string }>;
+      };
+    }
+
+    it('after a manual compaction', async () => {
+      const data = await turnRead([
+        userEntry('Review the branch'),
+        assistantEntry('Done.', '2026-07-21T00:00:01Z'),
+        boundary('manual'),
+      ]);
+      expect(data.messages.map((m) => [m.role, m.text])).toEqual([['assistant', 'Done.']]);
+      expect(data.messages.some((m) => m.compaction)).toBe(false);
+      expect(data.text).toBe('Done.');
+    });
+
+    it('after an idle compaction', async () => {
+      const data = await turnRead([
+        userEntry('Review the branch'),
+        assistantEntry('Done.', '2026-07-21T00:00:01Z'),
+        boundary('auto'),
+        userEntry('This session is being continued from a previous conversation.', { isCompactSummary: true }),
+        idleNotice,
+      ]);
+      expect(data.messages.map((m) => [m.role, m.text])).toEqual([['assistant', 'Done.']]);
+      expect(data.messages.some((m) => m.compaction)).toBe(false);
+      expect(data.text).toBe('Done.');
+    });
+  });
+
   it('draws a `!` command as typed, and its output as a code block Claude did not write', async () => {
     const id = harness.ctx._session.id;
     (harness.ctx._session as typeof harness.ctx._session & { claudeSessionId: string }).claudeSessionId = id;

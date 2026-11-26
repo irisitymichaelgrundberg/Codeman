@@ -9,7 +9,8 @@
  *     turn in the brief view, the same selection in the full view, and nothing
  *     left over from an earlier open.
  *  2. Tool and status blocks (DeepSeek, the external-CLI pane parser) are not the
- *     answer and are never copied, and neither is a prompt.
+ *     answer and are never copied, and neither is a prompt. A compaction's notice is
+ *     neither shown in the full view nor copied.
  *  3. An empty viewer and a refused clipboard both say so; neither reports success.
  *  4. The markup, phone layout and zh-CN strings the button depends on.
  *
@@ -187,6 +188,42 @@ describe('what Copy Markdown copies', () => {
     await app.loadFullContext();
     await app.copyResponseViewerMarkdown();
     expect(app._copyText).toHaveBeenCalledWith('latest response');
+  });
+
+  it('leaves a compaction out of the full view and never copies its notice', async () => {
+    const { body } = mountViewer();
+    const app = makeApp(
+      { text: 'brief' },
+      {
+        messages: [
+          { kind: 'prompt', role: 'user', text: 'ask', turn: 1 },
+          { kind: 'response', role: 'assistant', text: 'Done.', turn: 1 },
+          {
+            kind: 'response',
+            role: 'assistant',
+            text: 'Conversation compacted',
+            turn: 1,
+            compaction: 'manual',
+          },
+        ],
+      }
+    );
+    app.sessions = new Map([['s1', { mode: 'claude' }]]);
+    await app.toggleResponseViewer();
+    await app.loadFullContext();
+    expect(body.querySelectorAll('.rv-msg-assistant')).toHaveLength(1);
+    expect(body.textContent).not.toContain('Conversation compacted');
+    await app.copyResponseViewerMarkdown();
+    expect(app._copyText).toHaveBeenCalledWith('Done.');
+  });
+
+  it('never copies a compaction notice as the answer', () => {
+    const app = makeApp() as unknown as { _responseViewerMarkdownFrom(messages: unknown[]): string };
+    const markdown = app._responseViewerMarkdownFrom([
+      { kind: 'response', role: 'assistant', text: 'Done.', turn: 1 },
+      { kind: 'response', role: 'assistant', text: 'Conversation compacted', turn: 2, compaction: 'auto' },
+    ]);
+    expect(markdown).toBe('Done.');
   });
 
   it('keeps the brief answer when the full view finds no history and leaves it on screen', async () => {

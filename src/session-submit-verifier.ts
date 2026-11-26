@@ -24,7 +24,7 @@
  * Pure apart from the injected capture, send and log, so the schedule, the cap and
  * every stop condition are unit-tested with fake timers (test/session-submit-verifier.test.ts).
  */
-import { stripAnsi } from './utils/index.js';
+import { oneLineText, stripAnsi } from './utils/index.js';
 
 /**
  * When to look, counted from the write: 2 s catches the common case (taken) with one
@@ -75,18 +75,20 @@ export function plainFrame(styled: string): string {
 }
 
 /**
- * `screen` (a `capture-pane -p -e` frame) without the text Claude Code draws in an empty
- * composer that nobody typed: its prompt suggestion, drawn faint (SGR 2), and the suggestion's
- * first letter, which sits in the reverse-video cursor cell (SGR 7) right before the faint rest.
- * A typed draft is never faint, so a cursor cell followed by anything else is kept. Every line
- * break is kept, so line `n` here is line `n` of the plain frame, and plain text passes through
- * unchanged. Other escapes are left for `stripAnsi`.
+ * `screen` (a `capture-pane -p -e` frame) split in two: `typed` without the text Claude Code
+ * draws in an empty composer that nobody typed, and `suggestion` with only that text. The
+ * suggestion is drawn faint (SGR 2), and its first letter sits in the reverse-video cursor cell
+ * (SGR 7) right before the faint rest. A typed draft is never faint, so a cursor cell followed
+ * by anything else counts as typed. Both keep every line break, so line `n` of either is line
+ * `n` of the plain frame, and plain text passes through `typed` unchanged. Other escapes are
+ * left for `stripAnsi`.
  */
-function withoutSuggestion(screen: string): string {
+function splitSuggestion(screen: string): { typed: string; suggestion: string } {
   let faint = false;
   let inverse = false;
   let cursorCell = '';
-  let out = '';
+  let typed = '';
+  let suggestion = '';
   // eslint-disable-next-line no-control-regex
   for (const m of screen.matchAll(/\x1b\[([0-9;:]*)m|[\s\S]/gu)) {
     if (m[1] !== undefined) {
@@ -105,15 +107,33 @@ function withoutSuggestion(screen: string): string {
     }
     const ch = m[0];
     if (ch !== '\n' && faint) {
+      suggestion += cursorCell + ch;
       cursorCell = '';
       continue;
     }
-    out += cursorCell;
+    typed += cursorCell;
     cursorCell = '';
+    if (ch === '\n') suggestion += ch;
     if (ch !== '\n' && inverse) cursorCell = ch;
-    else out += ch;
+    else typed += ch;
   }
-  return out + cursorCell;
+  return { typed: typed + cursorCell, suggestion };
+}
+
+/**
+ * Finds the composer's lines, from the last `glyph` line down to its bottom rule. It returns null
+ * when either is missing.
+ */
+function composerSpan(plain: string, glyph: string): { at: number; end: number } | null {
+  // The structure is read at column 0, before any trimming: Claude Code draws the glyph line and
+  // both rules there and indents every continuation line, so a draft line that holds the glyph or
+  // starts with a rule (`  ❯`, `  ───`) can never pass for the composer's own edges.
+  const lines = plain.split('\n');
+  let at = lines.length - 1;
+  while (at >= 0 && !lines[at].startsWith(glyph)) at--;
+  if (at < 0) return null;
+  const end = lines.findIndex((l, i) => i > at && l.startsWith('\u2500'));
+  return end < 0 ? null : { at, end };
 }
 
 /**
@@ -131,17 +151,30 @@ function withoutSuggestion(screen: string): string {
  */
 export function composerIsEmpty(screen: string, glyph: string): boolean | undefined {
   if (!glyph) return undefined;
-  // The structure is read at column 0, before any trimming: Claude Code draws the glyph line and
-  // both rules there and indents every continuation line, so a draft line that holds the glyph or
-  // starts with a rule (`  ❯`, `  ───`) can never pass for the composer's own edges.
-  const lines = plainFrame(screen).split('\n');
-  let at = lines.length - 1;
-  while (at >= 0 && !lines[at].startsWith(glyph)) at--;
-  if (at < 0) return undefined;
-  const end = lines.findIndex((l, i) => i > at && l.startsWith('\u2500'));
-  if (end < 0) return undefined;
-  const typed = plainFrame(withoutSuggestion(screen)).split('\n');
-  return compact(typed[at].slice(glyph.length) + typed.slice(at + 1, end).join('')).length === 0;
+  const span = composerSpan(plainFrame(screen), glyph);
+  if (!span) return undefined;
+  const typed = plainFrame(splitSuggestion(screen).typed).split('\n');
+  return compact(typed[span.at].slice(glyph.length) + typed.slice(span.at + 1, span.end).join('')).length === 0;
+}
+
+/** A suggestion longer than this many UTF-16 code units is cut to it. */
+export const PROMPT_SUGGESTION_MAX_CHARS = 500;
+
+/**
+ * The prompt Claude Code suggests in its empty composer, as one line of plain text, or null
+ * when there is none: no composer on screen, something typed in it, or nothing faint there.
+ * Pass a STYLED frame (`capture-pane -p -e`), as for {@link composerIsEmpty}; a plain frame
+ * never shows a suggestion. The text is the model's, so it is only ever shown, never sent.
+ */
+export function composerSuggestion(screen: string, glyph: string): string | null {
+  if (composerIsEmpty(screen, glyph) !== true) return null;
+  const span = composerSpan(plainFrame(screen), glyph);
+  if (!span) return null;
+  const lines = plainFrame(splitSuggestion(screen).suggestion).split('\n');
+  // The glyph line's own glyph is not faint, so it is not in `lines`; continuation lines are
+  // indented, and the indent collapses with the rest of the whitespace.
+  const text = oneLineText(lines.slice(span.at, span.end).join(' '), PROMPT_SUGGESTION_MAX_CHARS, false);
+  return text || null;
 }
 
 export interface SubmitVerifierDeps {

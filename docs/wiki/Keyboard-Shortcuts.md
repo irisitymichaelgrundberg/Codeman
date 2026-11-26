@@ -49,6 +49,7 @@ The message box of [the chat view](Settings-Reference#header--panels) has keys o
 | `Enter`                       | Send. On a tablet, or any device whose main pointer is touch, `Enter` adds a line, and the Send button or `Ctrl+Enter` / `Cmd+Enter` sends. |
 | `Ctrl+Enter` / `Cmd+Enter`    | Send, on any device.                                         |
 | `Shift+Enter` / `Alt+Enter`   | Insert a newline without sending.                            |
+| `Tab` in an empty box         | Fill in the prompt Claude suggests next, when it suggests one. It is never sent on its own. |
 | `/` at the start of the box   | Open the command menu.                                       |
 | `Up` / `Down`                 | In the command menu: move the highlight.                     |
 | `Tab`                         | In the command menu: complete the highlighted command.       |

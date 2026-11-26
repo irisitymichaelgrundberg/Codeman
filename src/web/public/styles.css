@@ -24101,6 +24101,23 @@ body.keyboard-visible .terminal-container .xterm-screen {
   text-decoration: underline;
 }
 
+/* A compaction draws Claude Code's notice on a line across the thread. */
+.chat-view-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 16px 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.chat-view-divider::before,
+.chat-view-divider::after {
+  content: '';
+  flex: 1;
+  border-top: 1px solid var(--border);
+}
+
 .chat-view-dialog,
 .chat-view-composer {
   width: calc(100% - 32px);
@@ -24139,6 +24156,20 @@ body.keyboard-visible .terminal-container .xterm-screen {
   min-width: 0;
 }
 
+/* This line shows the command under a described Bash call. */
+.chat-view-status-sub {
+  margin-top: 2px;
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-view-status-sub[hidden] {
+  display: none;
+}
+
 .chat-view-status-dot {
   flex: none;
   margin-top: 6px;
@@ -24147,6 +24178,16 @@ body.keyboard-visible .terminal-container .xterm-screen {
   border-radius: 50%;
   background: var(--accent);
   animation: chat-view-pulse 1.4s ease-in-out infinite;
+}
+
+/* Between turns, background work that still runs shows a still, muted dot. */
+.chat-view-status--background .chat-view-status-dot {
+  background: var(--text-muted);
+  animation: none;
+}
+
+.chat-view-status--background .chat-view-status-text {
+  color: var(--text-muted);
 }
 
 @keyframes chat-view-pulse {
